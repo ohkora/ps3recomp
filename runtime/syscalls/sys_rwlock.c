@@ -5,6 +5,7 @@
 #include "sys_rwlock.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdio.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -84,6 +85,10 @@ int64_t sys_rwlock_create(ppu_context* ctx)
     if (id_out_addr != 0) {
         write_be32(id_out_addr, rwlock_id);
     }
+
+    { static int _n = 0; if (_n++ < 12) {
+        extern uint32_t ppu_thread_self_id(void);
+        fprintf(stderr, "[RWLOCK] create id=%u name='%.8s'\n", rwlock_id, r->name); } }
 
     return CELL_OK;
 }

@@ -271,3 +271,48 @@ s32 cellSpursJobQueueSemaphoreTryAcquire(CellSpursJobQueue* jq)
     (void)jq;
     return CELL_OK;
 }
+
+/* All-Stars (BCUS98472) boot path: attribute setters not yet implemented.
+ * Jobs are marked complete immediately, so these are safe no-ops. */
+s32 cellSpursJobQueueAttributeSetGrabParameters(CellSpursJobQueueAttribute* attr, u32 a, u32 b)
+{
+    (void)attr; (void)a; (void)b;
+    return CELL_OK;
+}
+
+s32 cellSpursJobQueueAttributeSetMaxSizeJobDescriptor(CellSpursJobQueueAttribute* attr, u32 v)
+{
+    (void)attr; (void)v;
+    return CELL_OK;
+}
+
+s32 cellSpursJobQueueAttributeSetSubmitWithEntryLock(CellSpursJobQueueAttribute* attr, u32 v)
+{
+    (void)attr; (void)v;
+    return CELL_OK;
+}
+
+s32 cellSpursJobQueueAttributeSetDoBusyWaiting(CellSpursJobQueueAttribute* attr, u32 v)
+{
+    (void)attr; (void)v;
+    return CELL_OK;
+}
+
+s32 cellSpursJobQueueAttributeSetIsHaltOnError(CellSpursJobQueueAttribute* attr, u32 v)
+{
+    (void)attr; (void)v;
+    return CELL_OK;
+}
+
+s32 cellSpursJobQueueAttributeSetIsJobTypeMemoryCheck(CellSpursJobQueueAttribute* attr, u32 v)
+{
+    (void)attr; (void)v;
+    return CELL_OK;
+}
+
+s32 _cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
+                             const CellSpursJobQueueAttribute* attr,
+                             void* buffer, u32 bufferSize)
+{
+    return cellSpursCreateJobQueue(spurs, jq, attr, buffer, bufferSize);
+}

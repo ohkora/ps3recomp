@@ -162,7 +162,8 @@ static struct LwmSlot { volatile long addr; HANDLE sem; volatile long state;
     volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
-             unsigned ppu_thread_prof_pc(unsigned tid); }
+             unsigned ppu_thread_prof_pc(unsigned tid);
+             void ydkj_release_pending_threads(void); }            /* sys_ppu_thread.c */
 static volatile long g_lwm_tab_lock = 0;
 /* PS3_LWMUTEX_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader.
  * Records, per mutex, the acquiring tid + a QPC microsecond timestamp; on a
@@ -272,13 +273,28 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             return;
         }
         if (!lwm_try(sl0)) {
+            /* PPU_THREADGATE: gated workers (created suspended) may only run once
+             * their creator blocks. The gate otherwise opens only on an
+             * event-queue wait, but PlayStation All-Stars (BCUS98472) first
+             * blocks on an lwmutex during FIOS start-up, which would leave its
+             * workers suspended. Open it on the creator's (tid 1) first
+             * contended lwmutex; a worker blocking first does not open it. */
+            if ((unsigned long long)ctx->thread_id == 1ull) {
+                ydkj_release_pending_threads();
+            }
             /* Contended: log who we're stuck behind (owner stamped at acquire),
              * then block. Bounded diagnostics for park hunts; uncapped while the
              * probe window is open (g_nd_inpump). */
             static long _bl = 0; long _b = ++_bl;
-            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u tmo=%lluus\n",
+            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u tmo=%lluus cia=0x%08X lr=0x%08X\n",
                 (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), vm_read32(lwm + LWM_RECUR),
-                (unsigned long long)timeout_us);
+                (unsigned long long)timeout_us, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+            { if (getenv("PS3_LWMEMDUMP")) {
+                char mb[1024]; int mp = 0;
+                mp += snprintf(mb + mp, sizeof(mb) - mp, "[LWM-MEM] lwm=0x%08X:", lwm);
+                for (int wo = -8; wo <= 8 && mp < 900; wo++)
+                    mp += snprintf(mb + mp, sizeof(mb) - mp, " %+d:0x%08X", wo * 4, vm_read32(lwm + wo * 4));
+                fprintf(stderr, "%s\n", mb); fflush(stderr); } }
             if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
                 long h = sl ? sl->holder : 0; long long held = (sl && h) ? (lwm_now_us() - sl->acq_us) : 0;
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",

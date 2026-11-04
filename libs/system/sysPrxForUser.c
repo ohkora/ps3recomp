@@ -1155,3 +1155,8 @@ s32 sys_process_get_paramsfo(void* buf)
     memset(yz_g2h(buf), 0, 256);
     return CELL_OK;
 }
+
+s32 _sys_spu_printf_initialize(void)
+{
+    return CELL_OK;
+}

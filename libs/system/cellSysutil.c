@@ -570,7 +570,10 @@ s32 cellSysCacheMount(char* param)
     cache_id[32] = '\0';
     printf("[cellSysutil] SysCacheMount(id='%s')\n", cache_id);
 
-    snprintf(s_cache_path, CELL_SYSCACHE_PATH_MAX, "/dev_hdd1/cache/%s", cache_id);
+    /* Match RPCS3: getCachePath is the bare "/dev_hdd1" mount root (the
+     * per-title subdir is handled by the VFS mount, not the path). All-Stars
+     * builds cache paths from this; a suffixed path double-nests it. */
+    snprintf(s_cache_path, CELL_SYSCACHE_PATH_MAX, "/dev_hdd1");
     size_t n = strlen(s_cache_path);
     if (n > 135) n = 135;
     memcpy(vm_base + ea + 0x20, s_cache_path, n);

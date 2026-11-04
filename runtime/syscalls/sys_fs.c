@@ -325,6 +325,9 @@ int64_t sys_fs_open(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
+    { extern char* getenv(const char*); if (getenv("PS3_SYSFSLOG")) {
+        fprintf(stderr, "[sysfs] open guest='%s' host='%s' flags=0x%x\n", ps3_path, host_path, flags); fflush(stderr); } }
+
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
         fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
@@ -723,6 +726,9 @@ int64_t sys_fs_stat(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
+    { extern char* getenv(const char*); if (getenv("PS3_SYSFSLOG")) {
+        fprintf(stderr, "[sysfs] stat guest='%s' host='%s'\n", ps3_path, host_path); fflush(stderr); } }
+
     struct stat st;
 #ifdef _WIN32
     if (_stat64(host_path, (struct _stat64*)&st) != 0)
@@ -730,6 +736,8 @@ int64_t sys_fs_stat(ppu_context* ctx)
     if (stat(host_path, &st) != 0)
 #endif
     {
+        { extern char* getenv(const char*); if (getenv("PS3_SYSFSLOG")) {
+            fprintf(stderr, "[sysfs] stat -> ENOENT\n"); fflush(stderr); } }
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 
@@ -933,6 +941,9 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+
+    { extern char* getenv(const char*); if (getenv("PS3_SYSFSLOG")) {
+        fprintf(stderr, "[sysfs] mkdir guest='%s' host='%s'\n", ps3_path, host_path); fflush(stderr); } }
 
 #ifdef _WIN32
     int rc = _mkdir(host_path);
