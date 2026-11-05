@@ -34,6 +34,8 @@ typedef struct {
 
 static JqState s_queues[CELL_SPURS_JQ_MAX_QUEUES];
 
+static int jq_trace(void);   /* SPURS_JQ_TRACE=1, see the port2 section */
+
 /* Check whether a job ID has completed in the given queue */
 static int jq_is_completed(const JqState* q, CellSpursJobId id)
 {
@@ -98,6 +100,11 @@ s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
     jq = GUEST_PTR(jq, CellSpursJobQueue*);
     (void)spurs; (void)buffer; (void)bufferSize;
     printf("[cellSpursJq] CreateJobQueue()\n");
+    if (jq_trace())
+        fprintf(stderr, "[cellSpursJq] CreateJobQueue(spurs=0x%08X jq=0x%08X attr=0x%08X buf=0x%08X size=%u)\n",
+                (u32)(uintptr_t)spurs, jq ? (u32)((u8*)jq - vm_base) : 0,
+                attr ? (u32)((const u8*)attr - vm_base) : 0,
+                (u32)(uintptr_t)buffer, bufferSize);
 
     if (!jq || !attr) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
@@ -181,6 +188,12 @@ s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
 
 s32 cellSpursJobQueuePort2Create(CellSpursJobQueue* jq, CellSpursJobQueuePort* port)
 {
+    /* Argument order unconfirmed against the SDK: trace both raw values and
+     * the first word each points at, so a call site can be checked. */
+    if (jq_trace())
+        fprintf(stderr, "[cellSpursJq] Port2Create(r3=0x%08X [0x%08X] r4=0x%08X [0x%08X])\n",
+                (u32)(uintptr_t)jq, jq ? vm_read32((u32)(uintptr_t)jq) : 0,
+                (u32)(uintptr_t)port, port ? vm_read32((u32)(uintptr_t)port) : 0);
     port = GUEST_PTR(port, CellSpursJobQueuePort*);
     jq = GUEST_PTR(jq, CellSpursJobQueue*);
     if (!jq || !port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
@@ -198,6 +211,9 @@ s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
                                    const void* job, u32 jobSize,
                                    u32 tag, CellSpursJobId* id)
 {
+    if (jq_trace())
+        fprintf(stderr, "[cellSpursJq] Port2PushSync(r3=0x%08X r4=0x%08X r5=0x%X r6=0x%X r7=0x%08X)\n",
+                (u32)(uintptr_t)port, (u32)(uintptr_t)job, jobSize, tag, (u32)(uintptr_t)id);
     port = GUEST_PTR(port, CellSpursJobQueuePort*);
     if (!port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
     CellSpursJobQueue jq = *port;
