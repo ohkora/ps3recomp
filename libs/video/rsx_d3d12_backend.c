@@ -705,9 +705,11 @@ static HWND create_window(u32 width, u32 height, const char* title)
 /* D3D12_VSYNC sets the present's sync interval, read once:
  *   0     present without waiting for the vblank, for measuring a title past
  *         the display's rate;
- *   2..4  present on every 2nd..4th vblank. A title that paces itself on its
- *         flips then runs at a half..quarter of the display's rate, and the
- *         GPU does that much less work: a lighter load for long test runs;
+ *   2..4  present on every 2nd..4th vblank: the window updates at a
+ *         half..quarter of the display's rate and the GPU does less work, a
+ *         lighter load for long test runs. The guest keeps its own pace where
+ *         the port drives the vblank and flip ticks off elapsed time and
+ *         catches up after a slow present, as boot_main's vblank_ticker does;
  *   unset, 1 or anything else: every vblank. Only the first character counts. */
 static int d3d12_sync_interval(void)
 {
