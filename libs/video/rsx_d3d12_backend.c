@@ -4385,6 +4385,44 @@ static void screen_copy_capture(u32 fi)
 
 }
 
+/* A display-sized texture with no offscreen RT behind it reads the screen copy
+ * only where the copy can stand in for it: a display buffer, which this
+ * backend draws into the backbuffer, or a surface whose guest bytes are still
+ * empty because the host drew it and never wrote it back. A display-sized
+ * image the guest did write is a texture like any other. PlayStation
+ * All-Stars Battle Royale (BCUS98472) binds a 1280x720 D8R8G8B8 menu image;
+ * through the screen copy its draw would show the previous frame instead.
+ * RT_DISPLAY_BY_SIZE=1 draws other display-sized surfaces into the backbuffer
+ * too, so it keeps the copy for all of them, and SCREEN_AS_TEX=2 keeps the
+ * old rule: display-sized is enough. */
+static int screen_copy_stands_in(const D3D12DrawRecord* dr, int u, int mode)
+{
+    extern int cellGcmOffsetIsDisplay(u32 offset);
+    extern uint8_t* vm_base;
+    static int by_size = -1;
+    if (by_size < 0) by_size = getenv("RT_DISPLAY_BY_SIZE") ? 1 : 0;
+    if (mode >= 2 || by_size || cellGcmOffsetIsDisplay(dr->tex[u].raw)) return 1;
+    if (!dr->tex[u].off || !vm_base) return 1;
+    /* About a thousand words spread over the whole image: a backdrop can
+     * start with rows of black. */
+    rsx_tex_layout tl;
+    rsx_texture_layout(dr->tex[u].fmt, dr->tex[u].w, dr->tex[u].h, &tl);
+    const u32 span = tl.face_bytes;
+    const u32 step = span > 4096u ? (span / 1024u) & ~3u : 4u;
+    for (u32 i = 0; i + 4u <= span; i += step) {
+        u32 w32;
+        memcpy(&w32, vm_base + dr->tex[u].off + i, sizeof w32);
+        if (w32) {
+            { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
+                fprintf(stderr, "[SCREENTEX] unit %d keeps its own %ux%u texture 0x%08X"
+                                " (fmt 0x%02X): the guest wrote it%c", u, dr->tex[u].w,
+                        dr->tex[u].h, dr->tex[u].raw, dr->tex[u].fmt, 10); }
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* rsx_topology -> D3D_PRIMITIVE_TOPOLOGY. Spelled out rather than relying on
  * the two enums happening to agree: the draw record carries the neutral value
  * so a second backend can read it, and this is the one place it becomes a D3D
@@ -4999,7 +5037,7 @@ static void render_frame(void)
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
-                if (en) {
+                if (en && screen_copy_stands_in(dr, _u, en)) {
                     { static int _n = 0; if (PS3_LOG_FIRST(_n, 3))
                         fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
                                         " fp=0x%X (%ux%u)%c", _u, dr->fp_addr,
