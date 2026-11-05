@@ -132,6 +132,7 @@ typedef struct {
                          * surface come out with black patches and banding. */
         int set;
         u32 addr, filter, ctrl0, border;   /* TEXTURE_ADDRESS/FILTER/CONTROL0/BORDER_COLOR */
+        u32 dim;        /* SET_TEXTURE_FORMAT bits 4..7: dimension (1, 2 or 3) */
     } tex[VP_TEX_UNITS];
     int tex_rt[VP_TEX_UNITS];   /* pre-pass: OffRT index sampled by unit, -1 = none */
     int tex_slot;       /* legacy single-slot path (atlas); -1 = none */
@@ -156,6 +157,7 @@ typedef struct {
     u32 zeta_off;       /* depth surface (SET_SURFACE_ZETA_OFFSET) when the surface has one */
     int no_color;       /* colour target NONE with a depth surface: a depth-only pass */
     int tex_ds[VP_TEX_UNITS];   /* pre-pass: OffDS read through unit u (its colour copy is tex_rt), -1 = none */
+    int tex_dz[VP_TEX_UNITS];   /* pre-pass: OffDS a depth-format unit u reads directly, -1 = none */
     /* Guest viewport rect at draw time (target pixels). Sub-viewport layouts
      * (wave's debug tiles) position quads with this, not with constants --
      * forcing full-target viewports drew every tile window-sized. */
@@ -281,6 +283,7 @@ typedef struct {
                              * pipelines and must not share a cache entry. */
     u64 zs;                 /* depth/stencil state, rsx_zs_key (PSO key) */
     u32 alpha;              /* alpha-test function compiled in, 0 = none (PSO key) */
+    u8  shadow[16];         /* depth comparison per sampled unit, packed (PSO key) */
     ID3D12PipelineState* pso;
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
@@ -389,7 +392,7 @@ typedef struct {
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t15). */
     struct { u32 off, raw, w, h, fmt, ctrl1, mips; int cube; int set;
-             u32 addr, filter, ctrl0, border; } cur_texs[VP_TEX_UNITS];
+             u32 addr, filter, ctrl0, border, dim; } cur_texs[VP_TEX_UNITS];
     /* Guest sampler states, one shader-visible descriptor each (samp_key[i]
      * describes descriptor i; 0 and 1 are the defaults for units with none). */
     ID3D12DescriptorHeap* samp_heap;
@@ -2364,6 +2367,35 @@ static u32 dr_alpha_func(const D3D12DrawRecord* dr)
     return func;
 }
 
+/* An RSX depth texture format: DEPTH24_D8 (0x90), DEPTH24_D8_FLOAT (0x91),
+ * DEPTH16 (0x92) or DEPTH16_FLOAT (0x93), with or without the LN/UN flags. */
+static int tex_fmt_is_depth(u32 fmt)
+{
+    const u32 base = fmt & 0x9Fu;
+    return base >= 0x90u && base <= 0x93u;
+}
+
+/* The depth comparison the guest set up on each of the draw's depth-format
+ * units (TEXTURE_CONTROL0 bit 31 with a compare function in TEXTURE_ADDRESS
+ * [31:28]; rsx_fp_shadow_desc_from_texture), or NULL when no unit compares.
+ * A shadow map read with a comparison returns the comparison's result, not the
+ * depth: the program is compiled with it (rsx_fp_decompile_buffered_shadow_ex),
+ * so it is part of the pipeline key. */
+static const rsx_fp_shadow_desc* dr_shadow_descs(const D3D12DrawRecord* dr,
+                                                 rsx_fp_shadow_desc out[VP_TEX_UNITS])
+{
+    int any = 0;
+    memset(out, 0, sizeof(rsx_fp_shadow_desc) * VP_TEX_UNITS);
+    for (int u = 0; u < VP_TEX_UNITS; u++) {
+        if (!dr->tex[u].set || !tex_fmt_is_depth(dr->tex[u].fmt)) continue;
+        rsx_fp_shadow_desc_from_texture(&out[u], dr->tex[u].fmt, dr->tex[u].dim,
+                                        dr->tex[u].cube ? 1u : 0u, dr->tex[u].mips,
+                                        dr->tex[u].filter, dr->tex[u].addr, dr->tex[u].ctrl0);
+        if (out[u].enabled) any = 1;
+    }
+    return any ? out : NULL;
+}
+
 /* Cache a guest-FP pipeline under its key, or with pso NULL the fact that the
  * key does not build. A program that fails to decompile, to compile or to make
  * a pipeline fails the same way every time its key comes back, and it comes
@@ -2396,7 +2428,8 @@ static void vp_fp_remember(const VPFPEntry* key, ID3D12PipelineState* pso)
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
-                                          u32 cube_mask, u64 zs, u32 alpha)
+                                          u32 cube_mask, u64 zs, u32 alpha,
+                                          const rsx_fp_shadow_desc* shadow)
 {
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;   /* 0: a depth-only pass */
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2441,6 +2474,26 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         }
     }
 
+    /* Depth comparison, on the units the program samples: one byte per unit,
+     * enabled | func << 2 | linear << 6 | unnormalized << 7. A comparison
+     * bound on a unit the program does not sample changes nothing, so it does
+     * not make a second pipeline. */
+    rsx_fp_shadow_desc sd[16];
+    u8 skey[16];
+    u32 scmp = 0;
+    memset(sd, 0, sizeof sd);
+    memset(skey, 0, sizeof skey);
+    if (shadow) {
+        const u32 su = rsx_fp_texture_units(vm_base + off, VP_FP_MAX_BYTES);
+        for (u32 u = 0; u < 16; u++)
+            if (((su >> u) & 1u) && shadow[u].enabled) {
+                sd[u] = shadow[u];
+                skey[u] = (u8)((sd[u].enabled & 3u) | ((sd[u].func & 15u) << 2) |
+                               ((sd[u].linear & 1u) << 6) | ((sd[u].unnormalized & 1u) << 7));
+                scmp |= 1u << u;
+            }
+    }
+
     s_perf_pso_calls++;
     /* Keyed on the code, not on where it lives. The compiled shader reads its
      * inline constants from the draw's own fp_addr (fp_constants[], refilled per draw),
@@ -2457,7 +2510,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].zs == zs &&
-            s_d3d.vp_fp[i].alpha == alpha)
+            s_d3d.vp_fp[i].alpha == alpha &&
+            !memcmp(s_d3d.vp_fp[i].shadow, skey, sizeof skey))
             return s_d3d.vp_fp[i].pso;   /* NULL: this key is known not to build */
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     VPFPEntry key;
@@ -2467,6 +2521,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.rtfmt = (u32)rtfmt; key.ctrl = ctrl;      key.ucode_hash = uhash;
     key.cmask = cmask;      key.cull = cull;      key.cube_mask = cube_mask;
     key.zs = zs;            key.alpha = alpha;
+    memcpy(key.shadow, skey, sizeof skey);
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
      * misses on ucode_hash" is. */
@@ -2490,7 +2545,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             VPFPEntry* q = &s_d3d.vp_fp[i];
             if (q->fp_addr != fp_addr) continue;
             n++;
-            fprintf(stderr, "[PSOMISS] fp=0x%X differs:%s%s%s%s%s%s%s%s%s%c", fp_addr,
+            fprintf(stderr, "[PSOMISS] fp=0x%X differs:%s%s%s%s%s%s%s%s%s%s%c", fp_addr,
                     q->vs_idx != vs_idx        ? " vs_idx"     : "",
                     q->vs_hash != vs_hash      ? " vs_hash"    : "",
                     q->gen != s_d3d.vp_gen     ? " gen"        : "",
@@ -2499,7 +2554,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                     q->rtfmt != (u32)rtfmt     ? " rtfmt"      : "",
                     q->ucode_hash != uhash     ? " ucode_hash" : "",
                     q->cube_mask != cube_mask  ? " cube_mask"  : "",
-                    q->alpha != alpha          ? " alpha"      : "", 10);
+                    q->alpha != alpha          ? " alpha"      : "",
+                    memcmp(q->shadow, skey, sizeof skey) ? " shadow" : "", 10);
             break;
         } } }
     /* CUBEKEYDBG=1: which (program, cube mask) pairs are being compiled. If one
@@ -2535,9 +2591,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * hashes the code without its constants, so every later draw of the same
      * code -- whatever constants the title had patched in since -- ran with the
      * ones the first draw compiled in. */
+    /* Units with a depth comparison sample through _rsx_shadowN(), which reads
+     * the depth from .r of the bound depth surface and compares it with the
+     * coordinate's z. A layout the decompiler cannot compare fails the build. */
     u32 nconst = 0;
-    int n = rsx_fp_decompile_buffered_ex(vm_base + off, VP_FP_MAX_BYTES, fp_ctrl, 0u,
-                                         hlsl, sizeof(hlsl), &nconst);
+    int n = rsx_fp_decompile_buffered_shadow_ex(vm_base + off, VP_FP_MAX_BYTES, fp_ctrl, 0u,
+                                                scmp ? sd : NULL,
+                                                hlsl, sizeof(hlsl), &nconst);
     const char* why = NULL;
     if (n <= 0)
         why = rsx_fp_program_size(vm_base + off, VP_FP_MAX_BYTES) ? "decompile failed"
@@ -2551,6 +2611,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                vp_fp_remember(&key, NULL); return NULL; }
     if (alpha) { static int _a = 0; if (PS3_LOG_FIRST(_a, 8))
         printf("[FP] fp=0x%08X compiled with alpha test 0x%03X\n", fp_addr, alpha); }
+    if (scmp) { static int _s = 0; if (PS3_LOG_FIRST(_s, 8))
+        printf("[FP] fp=0x%08X compiled with depth comparison on units 0x%04X\n", fp_addr, scmp); }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -4776,7 +4838,7 @@ static void render_frame(void)
                 off_rt_get(dr->rt_mrt[_m], dr->rt_w, dr->rt_h, dr->rt_fmt);
         if (dr->is_vp && dr->zeta_off && (dr->rt_off || dr->no_color))
             off_ds_get(dr->zeta_off, dr->rt_w, dr->rt_h);
-        for (int _u = 0; _u < VP_TEX_UNITS; _u++) dr->tex_ds[_u] = -1;   /* set below for draws */
+        for (int _u = 0; _u < VP_TEX_UNITS; _u++) dr->tex_ds[_u] = dr->tex_dz[_u] = -1;   /* set below for draws */
     }
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         const D3D12DrawRecord* dr = &s_d3d.draws[_d];
@@ -4784,6 +4846,7 @@ static void render_frame(void)
             const int ds = dr->tex[_u].set ? off_ds_find(dr->tex[_u].raw) : -1;
             if (ds < 0) continue;
             s_d3d.off_ds[ds].last_frame = s_d3d.frame_count;
+            if (tex_fmt_is_depth(dr->tex[_u].fmt)) continue;   /* read directly, no colour copy */
             off_rt_get(dr->tex[_u].raw, s_d3d.off_ds[ds].w, s_d3d.off_ds[ds].h, 0x08u);
         }
     }
@@ -4881,6 +4944,39 @@ static void render_frame(void)
         for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * VP_TEX_UNITS + (u32)_u;
             dr->tex_rt[_u] = -1;
+            /* A depth-format unit (DEPTH24_D8 or DEPTH16, fixed or float) reads
+             * its depth surface itself: the depth in every channel, which is
+             * what a plain depth read and the program's depth comparison
+             * (_rsx_shadowN, which reads .r) both take. The replay makes the
+             * surface a shader resource before the draw. A draw cannot sample
+             * the depth buffer it is testing against, and a depth texture with
+             * no depth surface behind it has nothing to read, so in those two
+             * cases the unit is left unbound. Before, depth formats were not
+             * captured at all, and the unit kept whatever was bound before. */
+            if (dr->tex[_u].set && tex_fmt_is_depth(dr->tex[_u].fmt)) {
+                const int ds  = off_ds_find(dr->tex[_u].raw);
+                const int own = (dr->zeta_off && (dr->rt_off || dr->no_color))
+                              ? off_ds_find(dr->zeta_off) : -1;
+                if (ds >= 0 && ds != own) {
+                    dr->tex_dz[_u] = ds;
+                    srv_write(wslot, s_d3d.off_ds[ds].res, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                              D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0));
+                    { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
+                        fprintf(stderr, "[D3D12] unit %d reads depth surface 0x%08X (%ux%u) as a"
+                                        " %ux%u texture, fmt 0x%02X, fp=0x%X%c", _u, dr->tex[_u].raw,
+                                s_d3d.off_ds[ds].w, s_d3d.off_ds[ds].h, dr->tex[_u].w,
+                                dr->tex[_u].h, dr->tex[_u].fmt, dr->fp_addr, 10); }
+                } else {
+                    { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                        fprintf(stderr, "[D3D12] depth texture 0x%08X (fmt 0x%02X, unit %d) %s;"
+                                        " left unbound%c", dr->tex[_u].raw, dr->tex[_u].fmt, _u,
+                                ds < 0 ? "has no depth surface" : "is the draw's own depth buffer",
+                                10); }
+                    srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                }
+                continue;
+            }
             /* A depth surface read as a texture: its colour copy (made in the
              * RT pre-pass), refreshed from the depth buffer just before this
              * draw (ds_convert). */
@@ -4985,12 +5081,13 @@ static void render_frame(void)
         }
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
+        rsx_fp_shadow_desc _sd[VP_TEX_UNITS];
         if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr),
-                                       dr->zs_key, dr_alpha_func(dr));
+                                       dr->zs_key, dr_alpha_func(dr), dr_shadow_descs(dr, _sd));
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -5367,6 +5464,7 @@ static void render_frame(void)
                 }
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
                  * back to the hardcoded atlas/colour PS pair. */
+                rsx_fp_shadow_desc _sd[VP_TEX_UNITS];
                 ID3D12PipelineState* dpso =
                     dr->fp_addr ? vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                                 dr_num_rts(dr),
@@ -5374,7 +5472,7 @@ static void render_frame(void)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_ctrl, dr->cmask, dr->cull,
                                                 dr_cube_mask(dr), dr->zs_key,
-                                                dr_alpha_func(dr)) : NULL;
+                                                dr_alpha_func(dr), dr_shadow_descs(dr, _sd)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
@@ -5407,12 +5505,18 @@ static void render_frame(void)
                 }
                 /* Per-draw textures: bind this draw's t0-t15 SRV window.
                  * Any sampled offscreen RT transitions to PSR first (never
-                 * one of the currently-bound colour targets). */
+                 * one of the currently-bound colour targets). So does a depth
+                 * surface read through a depth-format unit. That is never the
+                 * draw's own depth buffer (see the SRV fill), and a later draw
+                 * that renders into it moves it back to DEPTH_WRITE when it
+                 * binds it. */
                 for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                     int rt = dr->tex_rt[_u];
                     if (rt >= 0 && rt != cur_rt &&
                         rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2])
                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    if (dr->tex_dz[_u] >= 0 && dr->tex_dz[_u] != cur_z)
+                        off_ds_transition(dr->tex_dz[_u], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
                 gh.ptr += (u64)(DRAW_SRV_BASE + d * VP_TEX_UNITS) * s_d3d.srv_inc;
@@ -7158,7 +7262,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                     dr->tex_rt[_u]  = -1;
                 }
@@ -7279,7 +7383,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                 dr->tex_rt[_u]  = -1;
             }
@@ -7446,7 +7550,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
             dr->tex_rt[_u]  = -1;
         }
@@ -7547,7 +7651,8 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         (base_fmt == 0x81 /* B8 */ || base_fmt == 0x85 /* A8R8G8B8 */ ||
          base_fmt == 0x8B /* G8B8: LBP's font atlas */ ||
          (base_fmt >= 0x86 && base_fmt <= 0x88) /* DXT1/23/45 */ ||
-         base_fmt == 0x9A /* W16Z16Y16X16 half-float: RTT intermediates */)) {
+         base_fmt == 0x9A /* W16Z16Y16X16 half-float: RTT intermediates */ ||
+         tex_fmt_is_depth(format) /* read from its depth surface */)) {
         /* TEX_RESOLVE_AUTO=1: resolve through the page tables (local-page map
          * then IO table) instead of trusting the format's location bits. A
          * texture the guest built in main memory but tagged local resolves to
@@ -7599,6 +7704,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].filter = tex->filter;
         s_d3d.cur_texs[unit].ctrl0  = tex->control0;
         s_d3d.cur_texs[unit].border = tex->border_color;
+        s_d3d.cur_texs[unit].dim    = (tex->format >> 4) & 15u;
         if (env_str("TEXFMTDBG", &s_env_texfmtdbg)) { static u32 seen[64]; static int ns=0;
             u32 k = (unit<<24) | (((tex->format>>8) & 0xFFu)<<16) | (width & 0xFFFFu);
             int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
