@@ -254,8 +254,15 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    /* A fast form leaves r2 alone, but the caller still reloads it with
+     * `ld r2, 0x28(r1)` after the call, so the slot has to hold it, exactly as
+     * the full path's _TocGuard leaves it on exit. Returning without that only
+     * works while an earlier full import from the same frame happens to have
+     * filled the slot: PlayStation All-Stars Battle Royale's start-up takes an
+     * lwmutex as its first import in a fresh frame, reloads r2 = 0 from the
+     * zeroed entry stack, and exits through a chain of null TOC-relative loads. */
     if (const hle_fast_fn f = hle_fast(nid))
-        if (f(ctx)) return;
+        if (f(ctx)) { vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); return; }
 
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
