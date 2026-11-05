@@ -88,6 +88,8 @@ s32 cellSpursJobQueueAttributeSetMaxGrab(CellSpursJobQueueAttribute* attr, u32 m
 s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
                             const CellSpursJobQueueAttribute* attr,
                             void* buffer, u32 bufferSize);
+s32 _cellSpursCreateJobQueue(u64 jqRevision, u64 sdkVersion, u64 spurs,
+                             u64 jq, u64 attr);
 s32 cellSpursDestroyJobQueue(CellSpursJobQueue* jq);
 
 s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
@@ -95,7 +97,7 @@ s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
 s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
                              u32 tag, CellSpursJobId* id);
 
-s32 cellSpursJobQueuePort2Create(CellSpursJobQueue* jq, CellSpursJobQueuePort* port);
+s32 cellSpursJobQueuePort2Create(CellSpursJobQueuePort* port, CellSpursJobQueue* jq);
 s32 cellSpursJobQueuePort2Destroy(CellSpursJobQueuePort* port);
 s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
                                    const void* job, u32 jobSize,

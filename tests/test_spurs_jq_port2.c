@@ -15,7 +15,7 @@
 #include <string.h>
 #include "cellSpursJq.h"
 
-#define MEM_SIZE 0x100000u
+#define MEM_SIZE 0x400000u   /* covers 0x330000, the SDK version a shifted create used as a pointer */
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 /* Write-watch / reservation hooks the inline vm_write accessors reference. */
@@ -137,6 +137,30 @@ int main(void)
     CHECK(g_spurs_jq_port2_rejected == 7, "rejected=%u", g_spurs_jq_port2_rejected);
     CHECK(cellSpursJobQueuePort2Sync(0, 0) == (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT,
           "sync on a null port");
+
+    /* 5. Create + Port2Create in the order BCUS98472 uses them:
+     * _cellSpursCreateJobQueue(rev=2, sdk=0x00330000, spurs, jq, attr) and
+     * Port2Create(port, jq). The SDK version must not be taken as a pointer,
+     * and the port must end up naming the queue without the queue being
+     * overwritten from the (empty) port. */
+    {
+        enum { SPURS = 0x8000, JQ = 0x9000, ATTR = 0xA000, PORT2 = 0xB000, SDK = 0x00330000 };
+        wr32(SDK, 0x5A5A5A5Au);
+        memset(vm_base + PORT2, 0, 128);
+        CHECK(cellSpursJobQueueAttributeInitialize((CellSpursJobQueueAttribute*)(uintptr_t)ATTR) == CELL_OK,
+              "attr init");
+        /* Occupy slot 0 so the queue lands in a nonzero slot, which shows
+         * whether the port really received it. */
+        CHECK(_cellSpursCreateJobQueue(2, SDK, SPURS, JQ + 0x100, ATTR) == CELL_OK, "create #0");
+        CHECK(_cellSpursCreateJobQueue(2, SDK, SPURS, JQ, ATTR) == CELL_OK, "create #1");
+        CHECK(rd32(SDK) == 0x5A5A5A5Au, "create wrote through the SDK version as a pointer");
+        uint32_t qword = *(uint32_t*)(vm_base + JQ);
+        CHECK(qword == 1, "queue handle %u, expected slot 1", qword);
+        CHECK(cellSpursJobQueuePort2Create((CellSpursJobQueuePort*)(uintptr_t)PORT2,
+                                           (CellSpursJobQueue*)(uintptr_t)JQ) == CELL_OK, "port2 create");
+        CHECK(*(uint32_t*)(vm_base + JQ) == 1, "Port2Create overwrote the queue");
+        CHECK(*(uint32_t*)(vm_base + PORT2) == 1, "port does not name the queue");
+    }
 
     fprintf(stderr, "spurs-jq-port2: %s (%d failures)\n", fails ? "FAIL" : "ok", fails);
     return fails != 0;

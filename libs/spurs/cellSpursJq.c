@@ -124,6 +124,24 @@ s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
     return CELL_OK;
 }
 
+/* The real export behind the SDK's inline cellSpursCreateJobQueue:
+ *   r3 = job-queue revision, r4 = SDK version (0x00330000 for SDK 3.3.0),
+ *   r5 = CellSpurs*, r6 = CellSpursJobQueue*, r7 = attribute
+ * (BCUS98472: r3=2, r4=0x00330000, r5=0x10015100, r6=0x1001D580, r7 on the
+ * stack; r6 is the queue its Port2Create then names). Any further arguments
+ * are not needed for the bookkeeping kept here. */
+s32 _cellSpursCreateJobQueue(u64 jqRevision, u64 sdkVersion, u64 spurs,
+                             u64 jq, u64 attr)
+{
+    if (jq_trace())
+        fprintf(stderr, "[cellSpursJq] _CreateJobQueue(rev=%u sdk=0x%08X spurs=0x%08X jq=0x%08X attr=0x%08X)\n",
+                (u32)jqRevision, (u32)sdkVersion, (u32)spurs, (u32)jq, (u32)attr);
+    return cellSpursCreateJobQueue((void*)(uintptr_t)(u32)spurs,
+                                   (CellSpursJobQueue*)(uintptr_t)(u32)jq,
+                                   (const CellSpursJobQueueAttribute*)(uintptr_t)(u32)attr,
+                                   NULL, 0);
+}
+
 s32 cellSpursDestroyJobQueue(CellSpursJobQueue* jq)
 {
     jq = GUEST_PTR(jq, CellSpursJobQueue*);
@@ -186,14 +204,14 @@ s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
     return cellSpursJobQueuePush(jq, job, sizeof(CellSpursJob256), tag, id);
 }
 
-s32 cellSpursJobQueuePort2Create(CellSpursJobQueue* jq, CellSpursJobQueuePort* port)
+/* SDK order is (port, queue), confirmed on BCUS98472: r3 is the port every
+ * later push names, r4 the queue _cellSpursCreateJobQueue created. The old
+ * (queue, port) order copied the empty port over the queue's first word. */
+s32 cellSpursJobQueuePort2Create(CellSpursJobQueuePort* port, CellSpursJobQueue* jq)
 {
-    /* Argument order unconfirmed against the SDK: trace both raw values and
-     * the first word each points at, so a call site can be checked. */
     if (jq_trace())
-        fprintf(stderr, "[cellSpursJq] Port2Create(r3=0x%08X [0x%08X] r4=0x%08X [0x%08X])\n",
-                (u32)(uintptr_t)jq, jq ? vm_read32((u32)(uintptr_t)jq) : 0,
-                (u32)(uintptr_t)port, port ? vm_read32((u32)(uintptr_t)port) : 0);
+        fprintf(stderr, "[cellSpursJq] Port2Create(port=0x%08X jq=0x%08X)\n",
+                (u32)(uintptr_t)port, (u32)(uintptr_t)jq);
     port = GUEST_PTR(port, CellSpursJobQueuePort*);
     jq = GUEST_PTR(jq, CellSpursJobQueue*);
     if (!jq || !port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
