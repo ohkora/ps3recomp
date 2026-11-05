@@ -23,6 +23,10 @@ void ps3_stdio_init(void) {}
 HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
 BOOL CloseHandle(HANDLE) { std::abort(); }
 DWORD GetFileAttributesA(const char*) { std::abort(); }
+// ppu_hle.cpp's table of the HLE each guest thread is inside. Registering the
+// entry thread links the PS3_THREADS_AT report, which reads it; this fixture
+// never asks for a report (that would start a thread: CreateThread aborts).
+const char* g_hle_inflight[64];
 uint32_t ppu_load_elf(const char*);
 int ppu_run(uint32_t, uint32_t);
 extern uint32_t ppu_vm_size;

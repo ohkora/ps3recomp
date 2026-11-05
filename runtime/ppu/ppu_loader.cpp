@@ -908,11 +908,13 @@ static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
  * vm_write* reads g_resv_store_active directly (a hot global) so the default-off
  * path costs one predictable branch. */
 extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
+static void ppu_threads_at_start(void);    /* PS3_THREADS_AT, next to g_sc_inflight */
 extern "C" void ppu_resv_register(ppu_context* c)
 {
     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
     long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
     if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
+    if (i == 0) ppu_threads_at_start();    /* the first guest thread: boot */
 }
 /* Where every guest thread is, as a GUEST address.
  *
@@ -3192,6 +3194,82 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
+
+/* PS3_THREADS_AT=<s>[,<s>...]: at each of those times, in seconds after the
+ * first guest thread registered (the entry thread, at boot), report every
+ * guest thread: the HLE import or lv2 syscall it is inside, if any, its
+ * lr/r3/sp, and its guest stack (ppu_dump_guest_stack). The lines start with
+ * "[THREADS]" and "[GSTACK:t=<s>s tid=<n>]".
+ *
+ * g_hle_inflight (ppu_hle.cpp) and g_sc_inflight are written on every call,
+ * and only the boot harness's watchdog (runtime/ppu/tests/boot_main.cpp) read
+ * either. A title with its own main had no way to ask where its threads are,
+ * and that is the whole question when a game stops advancing without
+ * crashing: which thread is parked in which call, reached from where. Ask for
+ * two reports a few seconds apart; a parked thread shows the same call and
+ * the same stack in both.
+ *
+ * Best-effort and unlocked, like ppu_report_guest_lrs: a thread that runs
+ * while it is reported can show a torn stack. Contexts are never
+ * unregistered, so a thread that has exited still shows where it last was. */
+extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
+extern "C" void ppu_report_guest_threads(const char* label)
+{
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    fprintf(stderr, "[THREADS] --- %s: %ld guest thread(s) ---\n", label, n);
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (!c) continue;
+        const unsigned t = (unsigned)c->thread_id;
+        const char* hle = t < 64u ? g_hle_inflight[t] : nullptr;
+        const uint32_t sc = t < PS3_SC_INFLIGHT_MAX ? g_sc_inflight[t] : 0u;
+        char where[96];
+        if (hle)     snprintf(where, sizeof where, "inside HLE %s", hle);
+        else if (sc) snprintf(where, sizeof where, "inside syscall %u", (unsigned)sc);
+        else         snprintf(where, sizeof where, "no HLE import or syscall in flight");
+        fprintf(stderr, "[THREADS] guest-tid %-3u %s  lr=0x%08X r3=0x%08X sp=0x%08X\n",
+                t, where, (uint32_t)c->lr, (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+        char tag[64];
+        snprintf(tag, sizeof tag, "%s tid=%u", label, t);
+        ppu_dump_guest_stack(c, tag);
+    }
+    fflush(stderr);
+}
+static DWORD WINAPI ppu_threads_at_thread(LPVOID arg)
+{
+    const char* s = (const char*)arg;
+    const ULONGLONG t0 = GetTickCount64();
+    for (;;) {
+        char* end = nullptr;
+        const double secs = strtod(s, &end);
+        if (end == s || !(secs >= 0)) break;
+        const ULONGLONG due = t0 + (ULONGLONG)(secs * 1000.0);
+        for (ULONGLONG now; (now = GetTickCount64()) < due; )
+            Sleep((DWORD)(due - now));
+        char label[32];
+        snprintf(label, sizeof label, "t=%gs", secs);
+        ppu_report_guest_threads(label);
+        for (s = end; *s == ',' || *s == ' '; s++) {}
+        if (!*s) break;
+    }
+    return 0;
+}
+static void ppu_threads_at_start(void)
+{
+    static char spec[256];
+    /* PS3_THREADS_AT=<s>[,<s>...]: report every guest thread -- the HLE import
+     * or syscall it is in, lr/r3/sp, guest stack -- at those seconds after boot. */
+    const char* e = getenv("PS3_THREADS_AT");
+    if (!e || !*e) return;
+    snprintf(spec, sizeof spec, "%s", e);
+    HANDLE h = CreateThread(NULL, 0, ppu_threads_at_thread, spec, 0, NULL);
+    if (h) {
+        CloseHandle(h);
+        fprintf(stderr, "[THREADS] reports armed for t=%s s after boot\n", spec);
+    } else {
+        fprintf(stderr, "[THREADS] PS3_THREADS_AT: the report thread did not start\n");
+    }
+}
 
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
