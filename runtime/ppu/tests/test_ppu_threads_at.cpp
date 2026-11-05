@@ -23,6 +23,7 @@ static void nop(ppu_context*) {}
 
 extern "C" {
 uint8_t* vm_base;
+extern uint32_t ppu_vm_size;   // ppu_loader.cpp: guest memory size, 0 = no bound
 uint32_t ppu_hle_inject_base = 0x20000000;
 int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) { std::abort(); }
@@ -110,6 +111,19 @@ int main()
     ctx[2].thread_id = 9;
     ctx[2].gpr[1] = 0x00D00000;
     ctx[2].lr = 0x00020100;
+
+    // For PS3_PEEK: tid 1's r30 points at an object whose word +8 points at a
+    // second one, and that one's word +4 points back. tid 7's ctr holds the
+    // second object's address. Guest memory ends at 16 MB.
+    ppu_vm_size = 0x01000000;
+    ctx[0].gpr[30] = 0x00C00000;
+    be32(0x00C00000, 0x11111111);
+    be32(0x00C00004, 0x22222222);
+    be32(0x00C00008, 0x00C00100);
+    be32(0x00C0000C, 0x33333333);
+    for (uint32_t i = 0; i < 8; i++) be32(0x00C00100 + 4 * i, 0xAAAA0001 + i);
+    be32(0x00C00104, 0x00C00000);
+    ctx[1].ctr = 0x00C00100;
 
     for (ppu_context& c : ctx) ppu_resv_register(&c);
 

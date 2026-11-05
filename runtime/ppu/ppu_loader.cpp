@@ -3235,6 +3235,135 @@ extern "C" void ppu_report_guest_threads(const char* label)
     }
     fflush(stderr);
 }
+
+/* PS3_PEEK=<expr>:<len>[;<expr>:<len>...]: after each PS3_THREADS_AT report,
+ * dump <len> bytes (at most 0x200) of guest memory at each <expr>, as
+ * big-endian words, eight to a line. The lines start with "[PEEK]".
+ *
+ * A report says which registers a parked thread holds, but not what the
+ * objects they point at hold, and a wait loop's exit test is usually a field
+ * of such an object. Its address moves from run to run, so <expr> can name
+ * it the way the code reaches it. It is a sum of terms joined by + or -:
+ *   a number: 0x... hex, or decimal;
+ *   tN.rM, tN.lr or tN.ctr: that register of guest thread N, as the report
+ *     shows it;
+ *   [<expr>]: the big-endian word at that guest address.
+ * "[t1.r30]+0x10:0x40" dumps 0x40 bytes at 0x10 past the pointer held in
+ * thread 1's r30, and "[[0x00A12340]+4]:0x20" follows two pointers from a
+ * global. Items are separated by ';' or ','. */
+static ppu_context* ppu_peek_thread(uint64_t tid)
+{
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++)
+        if (g_resv_ctxs[i] && g_resv_ctxs[i]->thread_id == tid) return g_resv_ctxs[i];
+    return nullptr;
+}
+static bool ppu_peek_ok(uint64_t ea, uint32_t n)
+{
+    if (ea > 0xFFFFFFFFull) return false;
+    if (ppu_vm_size && ea + n > ppu_vm_size) return false;   /* before vm_oob's own report */
+    return ppu_dump_readable((uint32_t)ea, n);
+}
+struct ppu_peek_parse { const char* p; const char* err; };
+static bool ppu_peek_expr(ppu_peek_parse& e, uint64_t& out);
+static bool ppu_peek_term(ppu_peek_parse& e, uint64_t& out)
+{
+    while (*e.p == ' ') e.p++;
+    const char c = *e.p;
+    if (c == '[') {
+        e.p++;
+        uint64_t ea;
+        if (!ppu_peek_expr(e, ea)) return false;
+        while (*e.p == ' ') e.p++;
+        if (*e.p != ']') { e.err = "missing ]"; return false; }
+        e.p++;
+        if (!ppu_peek_ok(ea, 4)) { e.err = "a pointer it reads is outside guest memory"; return false; }
+        uint32_t w; memcpy(&w, vm_base + (uint32_t)ea, 4);
+        out = __builtin_bswap32(w);
+        return true;
+    }
+    if (c == 't' && e.p[1] >= '0' && e.p[1] <= '9') {
+        char* end = nullptr;
+        const unsigned long long tid = strtoull(e.p + 1, &end, 10);
+        const ppu_context* t = ppu_peek_thread(tid);
+        if (*end != '.') { e.err = "expected tN.rM, tN.lr or tN.ctr"; return false; }
+        const char* r = end + 1;
+        if (!t) { e.err = "no guest thread with that id"; return false; }
+        if (r[0] == 'r' && r[1] >= '0' && r[1] <= '9') {
+            const unsigned long reg = strtoul(r + 1, &end, 10);
+            if (reg > 31) { e.err = "registers are r0-r31"; return false; }
+            out = t->gpr[reg]; e.p = end; return true;
+        }
+        if (!strncmp(r, "lr", 2))  { out = t->lr;  e.p = r + 2; return true; }
+        if (!strncmp(r, "ctr", 3)) { out = t->ctr; e.p = r + 3; return true; }
+        e.err = "expected tN.rM, tN.lr or tN.ctr"; return false;
+    }
+    if (c >= '0' && c <= '9') {
+        char* end = nullptr;
+        const bool hex = c == '0' && (e.p[1] == 'x' || e.p[1] == 'X');
+        out = strtoull(e.p, &end, hex ? 16 : 10);
+        e.p = end;
+        return true;
+    }
+    e.err = "expected a number, tN.rM or [...]";
+    return false;
+}
+static bool ppu_peek_expr(ppu_peek_parse& e, uint64_t& out)
+{
+    if (!ppu_peek_term(e, out)) return false;
+    for (;;) {
+        while (*e.p == ' ') e.p++;
+        const char op = *e.p;
+        if (op != '+' && op != '-') return true;
+        e.p++;
+        uint64_t v;
+        if (!ppu_peek_term(e, v)) return false;
+        out = op == '+' ? out + v : out - v;
+    }
+}
+static void ppu_report_peeks(const char* label)
+{
+    const char* spec = getenv("PS3_PEEK");
+    if (!spec || !*spec) return;
+    char item[160];
+    for (const char* s = spec; *s; ) {
+        while (*s == ';' || *s == ',' || *s == ' ') s++;
+        if (!*s) break;
+        size_t n = strcspn(s, ";,");
+        if (n >= sizeof item) n = sizeof item - 1;
+        memcpy(item, s, n); item[n] = 0;
+        s += strcspn(s, ";,");
+        char* colon = strrchr(item, ':');
+        if (!colon) { fprintf(stderr, "[PEEK] %s %s: expected <expr>:<len>\n", label, item); continue; }
+        *colon = 0;
+        char* end = nullptr;
+        const char* lt = colon + 1;
+        while (*lt == ' ') lt++;
+        const bool hex = lt[0] == '0' && (lt[1] == 'x' || lt[1] == 'X');
+        unsigned long long len = strtoull(lt, &end, hex ? 16 : 10);
+        if (end == lt || len == 0) { fprintf(stderr, "[PEEK] %s %s:%s: bad length\n", label, item, colon + 1); continue; }
+        len = len > 0x200 ? 0x200 : (len + 3) & ~3ull;
+        ppu_peek_parse e = { item, nullptr };
+        uint64_t ea = 0;
+        bool ok = ppu_peek_expr(e, ea);
+        while (ok && *e.p == ' ') e.p++;
+        if (ok && *e.p) { e.err = "unexpected text after the address"; ok = false; }
+        if (!ok) { fprintf(stderr, "[PEEK] %s %s: %s\n", label, item, e.err); continue; }
+        fprintf(stderr, "[PEEK] %s %s = 0x%08llX (%llu bytes)\n", label, item,
+                (unsigned long long)ea, len);
+        for (uint64_t off = 0; off < len; off += 32) {
+            char line[160];
+            int p = snprintf(line, sizeof line, "[PEEK]   0x%08llX:", (unsigned long long)(ea + off));
+            for (uint64_t w = off; w < off + 32 && w < len; w += 4) {
+                if (!ppu_peek_ok(ea + w, 4)) { p += snprintf(line + p, sizeof line - p, " (outside guest memory)"); off = len; break; }
+                uint32_t v; memcpy(&v, vm_base + (uint32_t)(ea + w), 4);
+                p += snprintf(line + p, sizeof line - p, " %08X", __builtin_bswap32(v));
+            }
+            fprintf(stderr, "%s\n", line);
+        }
+    }
+    fflush(stderr);
+}
 static DWORD WINAPI ppu_threads_at_thread(LPVOID arg)
 {
     const char* s = (const char*)arg;
@@ -3249,6 +3378,7 @@ static DWORD WINAPI ppu_threads_at_thread(LPVOID arg)
         char label[32];
         snprintf(label, sizeof label, "t=%gs", secs);
         ppu_report_guest_threads(label);
+        ppu_report_peeks(label);
         for (s = end; *s == ',' || *s == ' '; s++) {}
         if (!*s) break;
     }
@@ -3266,6 +3396,8 @@ static void ppu_threads_at_start(void)
     if (h) {
         CloseHandle(h);
         fprintf(stderr, "[THREADS] reports armed for t=%s s after boot\n", spec);
+        const char* peek = getenv("PS3_PEEK");
+        if (peek && *peek) fprintf(stderr, "[PEEK] dumped after each report: %s\n", peek);
     } else {
         fprintf(stderr, "[THREADS] PS3_THREADS_AT: the report thread did not start\n");
     }

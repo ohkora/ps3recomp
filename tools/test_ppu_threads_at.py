@@ -30,11 +30,49 @@ EXPECT = [
 ]
 
 
-def run(binary, threads_at):
+PEEK = ';'.join([
+    '[t1.r30+8]:0x20',        # follow tid 1's r30 to the second object
+    't1.r30+0x4-4:12',        # register arithmetic, decimal length
+    '[[0x00C00000+8]+4]:8',   # two pointers from a "global"
+    't7.ctr:4',               # ctr
+    '0x00FFFFF8:0x10',        # runs off the end of guest memory
+    '0x00C00000:0x1000',      # capped at 0x200 bytes
+    't42.r3:4',               # errors, each on its own line
+    't1.r40:4',
+    '[t1.r30:4',
+    '0x100',
+    't1.lr:0',
+    '[0xFFFFFFFF+8]:4',
+])
+
+PEEK_EXPECT = [
+    '[PEEK] dumped after each report: ' + PEEK,
+    '[PEEK] t=0.1s [t1.r30+8] = 0x00C00100 (32 bytes)',
+    '[PEEK]   0x00C00100: AAAA0001 00C00000 AAAA0003 AAAA0004 AAAA0005 AAAA0006 AAAA0007 AAAA0008',
+    '[PEEK] t=0.1s t1.r30+0x4-4 = 0x00C00000 (12 bytes)',
+    '[PEEK]   0x00C00000: 11111111 22222222 00C00100',
+    '[PEEK] t=0.1s [[0x00C00000+8]+4] = 0x00C00000 (8 bytes)',
+    '[PEEK] t=0.3s t7.ctr = 0x00C00100 (4 bytes)',
+    '[PEEK]   0x00C00100: AAAA0001',
+    '[PEEK]   0x00FFFFF8: 00000000 00000000 (outside guest memory)',
+    '[PEEK] t=0.1s 0x00C00000 = 0x00C00000 (512 bytes)',
+    '[PEEK]   0x00C001E0:',
+    '[PEEK] t=0.1s t42.r3: no guest thread with that id',
+    '[PEEK] t=0.1s t1.r40: registers are r0-r31',
+    '[PEEK] t=0.1s [t1.r30: missing ]',
+    '[PEEK] t=0.1s 0x100: expected <expr>:<len>',
+    '[PEEK] t=0.1s t1.lr:0: bad length',
+    '[PEEK] t=0.1s [0xFFFFFFFF+8]: a pointer it reads is outside guest memory',
+]
+
+
+def run(binary, threads_at, peek=None):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('PPU_', 'PS3_', 'PS3RECOMP_', 'SPU_', 'BCTRL_'))}
     if threads_at is not None:
         env['PS3_THREADS_AT'] = threads_at
+    if peek is not None:
+        env['PS3_PEEK'] = peek
     r = subprocess.run([str(binary)], env=env, capture_output=True, text=True, timeout=60)
     if r.returncode or 'fixture done' not in r.stdout:
         sys.stderr.write(r.stderr[-2000:])
@@ -73,6 +111,22 @@ def main():
             sys.stderr.write(err[-2000:])
             raise SystemExit('FAIL: a report without PS3_THREADS_AT')
         print('PASS: no report unless asked for')
+
+        if '[PEEK]' in run(binary, '0.1,0.3'):
+            raise SystemExit('FAIL: a [PEEK] line without PS3_PEEK')
+        err = run(binary, '0.1,0.3', PEEK)
+        missing = [e for e in PEEK_EXPECT if e not in err]
+        if missing:
+            sys.stderr.write('\n'.join(l for l in err.splitlines() if l.startswith('[PEEK]'))[-4000:] + '\n')
+            raise SystemExit('FAIL: [PEEK] lines missing:\n  ' + '\n  '.join(missing))
+        if err.count('[PEEK] t=0.1s [t1.r30+8] = ') != 1 or err.count('[PEEK] t=0.3s [t1.r30+8] = ') != 1:
+            raise SystemExit('FAIL: expected one dump per item at each report time')
+        if '[PEEK]   0x00C00200:' in err or 'VM-OOB' in err:
+            raise SystemExit('FAIL: a dump past its 0x200-byte cap, or a guest-memory bounds report')
+        if err.index('[THREADS] --- t=0.3s') > err.index('[PEEK] t=0.3s [t1.r30+8]'):
+            raise SystemExit('FAIL: the dumps come before their thread report')
+        print('PASS: PS3_PEEK dumps registers, pointers and globals after each report, '
+              'and names each bad item')
 
 
 if __name__ == '__main__':
