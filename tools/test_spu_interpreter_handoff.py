@@ -25,7 +25,8 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
     failed = []
     for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-calls', 'stop-zero',
                  'nested-stop', 'stop-code', 'halt', 'smc', 'smc-ldst', 'smc-ldst-diag', 'pure-interpreter', 'stepcap', 'negative-stepcap',
-                 'unlifted-call-return', 'unlifted-top-rejoin', 'restart-stale-return']:
+                 'unlifted-call-return', 'unlifted-top-rejoin', 'unlifted-top-link',
+                 'unlifted-hop-stale-link', 'restart-stale-return']:
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
         if mode in ('stepcap', 'negative-stepcap'):

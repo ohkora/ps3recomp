@@ -54,6 +54,7 @@ static void nested_entry(spu_context* c) {
  * base (SPU_INTERP_UNLIFTED's path), as the lifter emits it: link, dispatch,
  * drain, then this frame's own continuation. */
 static void unlifted_call_entry(spu_context* c) {
+    c->gpr[5]._u32[0] = 0x16000;
     c->gpr[0] = spu_link(0x504);
     c->pc = 0x16000;
     c->host_depth++;
@@ -65,6 +66,27 @@ static void unlifted_call_entry(spu_context* c) {
 }
 static void unlifted_tail_entry(spu_context* c) {
     c->pc = 0x16000; g_spu_trampoline_fn = spu_indirect_branch;
+}
+/* The same transfer at top level, with $0 holding the return point of a call
+ * to the code: no host frame waits there, so the guest's own continuation
+ * must run rather than the run ending at it. */
+static void unlifted_top_link_entry(spu_context* c) {
+    c->gpr[5]._u32[0] = 0x16000;
+    c->gpr[0] = spu_link(0x504);
+    unlifted_tail_entry(c);
+}
+/* A computed jump into unlifted code, run as a hop of the drain for the call
+ * that returns to 0x204. $0 still holds the return point of an earlier call
+ * (0x600 -> 0x7000), which is not where this code returns. */
+static void hop_stale_link_entry(spu_context* c) {
+    c->gpr[0] = spu_link(0x604);
+    c->host_depth++;
+    c->pc = 0x16000;
+    g_spu_trampoline_fn = spu_indirect_branch;
+    spu_drain_call(c, 0x204);
+    c->host_depth--;
+    c->gpr[20]._u32[0]++;
+    finish(c);
 }
 /* Two drains deep: the outer call's drain runs a hop into a function that
  * makes its own call, and that callee returns to an unlifted mid-function pc.
@@ -179,6 +201,20 @@ int main(int argc, char** argv) {
         entry = unlifted_tail_entry; ctx.policy_mode = 0;
         word(0x16000, 0x04000082); /* ori $2,$1,0 */
         word(0x16004, 0x30004800); /* bra 0x240 */
+    } else if (!strcmp(mode, "unlifted-top-link")) {
+        entry = unlifted_top_link_entry; ctx.policy_mode = 0;
+        word(0x500, 0x35200280);   /* bisl $0,$5 */
+        word(0x504, 0x1C004A95);   /* ai $21,$21,1: the guest's own continuation */
+        word(0x508, 0x30004800);   /* bra 0x240 */
+        word(0x16000, 0x04000082); /* ori $2,$1,0 */
+        word(0x16004, 0x35000000); /* bi $0 -> 0x504 */
+    } else if (!strcmp(mode, "unlifted-hop-stale-link")) {
+        entry = hop_stale_link_entry; ctx.policy_mode = 0;
+        word(0x600, 0x330D4000);   /* brsl $0,0x7000: an earlier call */
+        word(0x604, 0x04000082);   /* ori $2,$1,0 */
+        word(0x608, 0x30004080);   /* bra 0x204: the real return point */
+        word(0x16000, 0x04000082); /* ori $2,$1,0 */
+        word(0x16004, 0x3000C080); /* bra 0x604 */
     } else if (!strcmp(mode, "restart-stale-return")) {
         /* A return lands on unlifted 0x4100 two drains deep and the inner
          * drain restarts dispatch. The outer drain's return pc (0x204) has
@@ -204,6 +240,12 @@ int main(int argc, char** argv) {
         assert(halted == 0 && ctx.status == SPU_STATUS_RUNNING);
         assert(ctx.pc == 0x4004 && ctx.gpr[11]._u32[0] == 0);
         assert(g_spu_trampoline_fn == NULL);
+        puts("PASS"); return 0;
+    }
+    if (!strcmp(mode, "unlifted-top-link")) {
+        assert(halted == 1 && ctx.status == SPU_STATUS_STOPPED_BY_STOP);
+        assert(ctx.gpr[11]._u32[0] == 1 && ctx.gpr[21]._u32[0] == 1);
+        assert(ctx.gpr[20]._u32[0] == 0);
         puts("PASS"); return 0;
     }
     if (!strcmp(mode, "restart-stale-return")) {
@@ -242,7 +284,8 @@ int main(int argc, char** argv) {
     assert(halted == 1 && ctx.status == SPU_STATUS_STOPPED_BY_STOP);
     assert(ctx.gpr[11]._u32[0] == 1);
     assert(ctx.gpr[20]._u32[0] == (!strncmp(mode, "nested-return", 13) ||
-                                    !strcmp(mode, "unlifted-call-return") ? 1u : 0u));
+                                    !strcmp(mode, "unlifted-call-return") ||
+                                    !strcmp(mode, "unlifted-hop-stale-link") ? 1u : 0u));
     assert(ctx.gpr[10]._u32[0] == (!strcmp(mode, "nested-calls") ? 2u : 0u));
     puts("PASS"); return 0;
 }

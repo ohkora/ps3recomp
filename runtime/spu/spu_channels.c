@@ -2388,23 +2388,33 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
  *
  * A lifted bisl writes its link and calls the dispatcher before its
  * spu_drain_call sets drain_ret_pc, so for a direct call drain_ret_pc still
- * names the enclosing call. The link names this one. When the word before $0
- * is a call that links through $0, $0 is a return point: this call's, or for
- * a tail transfer the caller's own, which is also where the tail-called code
- * returns. A $0 equal to the start pc is the return point the guest is
- * standing on, not one to stop at. Otherwise drain_ret_pc, as before. */
+ * names the enclosing call. The link names this one: $0 is the stop when the
+ * word before it is a call that links through $0 AND targets the start pc,
+ * i.e. that call is the one being entered. Anything else falls back to
+ * drain_ret_pc, which a drain hop has just set to its own return point: a
+ * computed jump inside a function leaves $0 at the return point of whatever
+ * that function called last, which is not where it returns. At top level no
+ * host frame waits for any return point, so there is no stop. */
 static uint32_t spu_interp_return_stop(const spu_context* ctx, uint32_t start)
 {
+    if (!ctx->host_depth) return 0;
+    const uint32_t pc = start & SPU_LS_MASK & ~3u;
     const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK & ~3u;
-    if (lr >= 4 && lr != (start & SPU_LS_MASK & ~3u)) {
-        const uint8_t* p = ctx->ls + lr - 4;
+    if (lr >= 4 && lr != pc) {
+        const uint32_t at = lr - 4;
+        const uint8_t* p = ctx->ls + at;
         const uint32_t w = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                            ((uint32_t)p[2] << 8) | p[3];
-        const uint32_t op9 = w >> 23, op11 = w >> 21;
-        if ((w & 0x7Fu) == 0 &&                                /* rt = $0 */
-            (op9 == 0x062 || op9 == 0x066 ||                   /* brasl, brsl */
-             op11 == 0x1A9 || op11 == 0x1AB))                  /* bisl, bisled */
-            return lr;
+        const uint32_t op9 = w >> 23, op11 = w >> 21, ra = (w >> 7) & 0x7Fu;
+        const uint32_t rel = (uint32_t)(int32_t)(int16_t)((w >> 7) & 0xFFFFu) << 2;
+        uint32_t target = 1u;                                   /* matches no pc */
+        if ((w & 0x7Fu) == 0) {                                 /* rt = $0 */
+            if (op9 == 0x066) target = (at + rel) & SPU_LS_MASK;        /* brsl */
+            else if (op9 == 0x062) target = rel & SPU_LS_MASK;          /* brasl */
+            else if ((op11 == 0x1A9 || op11 == 0x1AB) && ra)            /* bisl, bisled */
+                target = ctx->gpr[ra]._u32[0] & SPU_LS_MASK & ~3u;
+        }
+        if (target == pc) return lr;
     }
     return ctx->drain_ret_pc;
 }
