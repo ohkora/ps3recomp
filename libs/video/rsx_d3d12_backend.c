@@ -2463,6 +2463,61 @@ static void vp_fp_remember(const VPFPEntry* key, ID3D12PipelineState* pso)
     }
 }
 
+/* The FP_* debug switches in vp_get_fp_pso name a program by its address or
+ * by its code hash: the pipeline key's ucode hash, which the "[FP] ... ucode"
+ * lines and the switches' own lines print. A title that copies its patched
+ * programs into a ring every frame draws each program from a new address, and
+ * the pipeline is built once, at whichever address the program was first
+ * seen, so only the hash names such a program reliably. */
+static int fp_dbg_named(const char* env, u32 fp_addr, u32 uhash)
+{
+    const char* v = getenv(env);
+    if (!v || !*v) return 0;
+    const u32 want = (u32)strtoul(v, NULL, 16);
+    return want == fp_addr || want == uhash;
+}
+
+/* Make colour target 0 of a buffered decompile the HLSL expression expr: an
+ * assignment ahead of the program's final return, which is "return _rsx_out;"
+ * after an alpha test, "return _out;" with several targets or a depth export,
+ * and the NaN-guarded "_o" otherwise. 0 if the shape is not one of those. */
+static int fp_dbg_set_output(char* hlsl, size_t cap, const char* expr)
+{
+    char* ret = NULL;
+    for (char* p = strstr(hlsl, "    return "); p; p = strstr(p + 1, "    return "))
+        ret = p;
+    if (!ret) return 0;
+    const char* e = ret + 11;
+    const char* lhs = !strncmp(e, "_rsx_out;", 9)
+                      ? (strstr(hlsl, "PSOutput _rsx_out") ? "_rsx_out.t0" : "_rsx_out")
+                    : !strncmp(e, "_out;", 5) ? "_out.t0"
+                    : !strncmp(e, "(_o == _o)", 10) ? "_o" : NULL;
+    if (!lhs) return 0;
+    char line[320];
+    const int n = snprintf(line, sizeof line, "    %s = %s;\n", lhs, expr);
+    if (n <= 0 || (size_t)n >= sizeof line) return 0;
+    const size_t tail = strlen(ret) + 1;
+    if ((size_t)(ret - hlsl) + (size_t)n + tail > cap) return 0;
+    memmove(ret + n, ret, tail);
+    memcpy(ret, line, (size_t)n);
+    return 1;
+}
+
+/* Discard every fragment of a buffered decompile: a discard first thing in main. */
+static int fp_dbg_discard(char* hlsl, size_t cap)
+{
+    char* m = strstr(hlsl, "main(PSInput input)");
+    char* b = m ? strstr(m, "{\n") : NULL;
+    if (!b) return 0;
+    b += 2;
+    static const char ins[] = "    discard;\n";
+    const size_t nl = sizeof ins - 1, tail = strlen(b) + 1;
+    if ((size_t)(b - hlsl) + nl + tail > cap) return 0;
+    memmove(b + nl, b, tail);
+    memcpy(b, ins, nl);
+    return 1;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
                                           u32 cube_mask, u64 zs, u32 alpha,
@@ -2668,85 +2723,48 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(f, " */\n%s\n", hlsl); fclose(f);
         } } }
 
-    /* FP_PICK=<hex fp_addr>: write just that program, whatever order it compiles
-     * in. fp_dump.hlsl keeps only the first four, same trap as vp2_dump.hlsl. */
-    { static const char* fpk = (const char*)1; static u32 wantf = 0; static int done = 0;
-      if (fpk == (const char*)1) { fpk = getenv("FP_PICK");
-                                   wantf = fpk ? (u32)strtoul(fpk, NULL, 16) : 0; }
-      if (wantf && !done && fp_addr == wantf) { done = 1;
+    /* FP_PICK=<hex fp_addr or ucode hash>: write just that program, whatever
+     * order it compiles in. fp_dump.hlsl keeps only the first four, same trap
+     * as vp2_dump.hlsl. */
+    { static int done = 0;
+      if (!done && fp_dbg_named("FP_PICK", fp_addr, uhash)) { done = 1;
           FILE* f = fopen("duck_fp.hlsl", "w");
-          if (f) { fprintf(f, "/* fp_addr=0x%08X, %d instrs */%s", fp_addr, n, hlsl);
+          if (f) { fprintf(f, "/* fp_addr=0x%08X ucode %08X, %d instrs */%s", fp_addr, uhash, n, hlsl);
                    fclose(f); }
-          fprintf(stderr, "[DUCKFP] wrote duck_fp.hlsl (fp=0x%08X, %d instrs)%c",
-                  fp_addr, n, 10);
+          fprintf(stderr, "[DUCKFP] wrote duck_fp.hlsl (fp=0x%08X ucode %08X, %d instrs)%c",
+                  fp_addr, uhash, n, 10);
       } }
 
-    /* Debug FP_ONE=<hex fp_addr>: force that program's colour output to
-     * all-ones (e.g. wave's colour-detect -> full mask -> island borders
-     * everywhere -> the water sim must visibly radiate if it works). */
-    { const char* f1 = getenv("FP_ONE");
-      if (f1 && (u32)strtoul(f1, NULL, 16) == fp_addr) {
-          /* Match the assignment, not one exact spelling of it: the final
-           * register is r[N] for some programs and h[N] for others, and the old
-           * fixed "= r[0];" anchor silently did nothing for every h[] shader --
-           * so this switch appeared to have no effect and was useless for
-           * identifying which program draws what. Rewrite the expression with a
-           * proper length-changing splice. */
-          char* rp = strstr(hlsl, "_po.c0 = ");
-          if (rp) {
-              char* semi = strchr(rp, ';');
-              if (semi) {
-                  static const char rep[] = "_po.c0 = (1.0).xxxx";
-                  size_t oldlen = (size_t)(semi - rp), newlen = sizeof(rep) - 1;
-                  size_t tail = strlen(semi) + 1;
-                  if ((rp - hlsl) + newlen + tail < sizeof(hlsl)) {
-                      memmove(rp + newlen, semi, tail);
-                      memcpy(rp, rep, newlen);
-                  }
-                  (void)oldlen;
-              }
-          }
-      } }
-    /* FP_TEX=1: make every program output its unit-0 texture sample verbatim.
-     * Separates "the texture is wrong" from "the shading tints it" in one run,
-     * without having to identify which program draws which surface first. */
+    /* The switches below rewrite the buffered decompile's output (see
+     * fp_dbg_set_output); they used to look for the "_po.c0 = " and
+     * "PSOut _po;" of an older decompiler output, found neither, and did
+     * nothing. Each one prints a line when it takes effect. */
+    /* Debug FP_ONE=<hex fp_addr or ucode hash>: force that program's colour
+     * output to all-ones (e.g. wave's colour-detect -> full mask -> island
+     * borders everywhere -> the water sim must visibly radiate if it works). */
+    if (fp_dbg_named("FP_ONE", fp_addr, uhash) &&
+        fp_dbg_set_output(hlsl, sizeof hlsl, "(1.0).xxxx"))
+        fprintf(stderr, "[FPONE] fp=0x%X ucode %08X outputs 1%c", fp_addr, uhash, 10);
     /* FP_SHOW=<hlsl expr>: replace a program's colour output with an arbitrary
-     * expression (e.g. FP_SHOW=h[1]) so an intermediate register can be looked
-     * at directly. Restrict with FP_TEX_FP=<hex>. Reading a 69-instruction
-     * shader to guess which term carries a bad value is slower and less certain
-     * than displaying the terms. */
-    /* FP_KILL=<hex fp_addr>: make that program discard every fragment, so what
-     * it covers becomes visible. Distinguishes "this surface shades black" from
-     * "this surface is correct and something else is missing behind it". */
-    { const char* kf = getenv("FP_KILL");
-      if (kf && (u32)strtoul(kf, NULL, 16) == fp_addr) {
-          char* rp = strstr(hlsl, "PSOut _po;");
-          if (rp) {
-              const char* ins = "discard; ";
-              size_t nl = strlen(ins), tail = strlen(rp) + 1;
-              if ((size_t)(rp - hlsl) + nl + tail < sizeof(hlsl)) {
-                  memmove(rp + nl, rp, tail);
-                  memcpy(rp, ins, nl);
-                  fprintf(stderr, "[FPKILL] fp=0x%X discards%c", fp_addr, 10);
-              }
-          }
-      } }
+     * expression (e.g. FP_SHOW=h[1], or fp_constants[3]) so an intermediate
+     * register can be looked at directly. Restrict with FP_TEX_FP=<hex fp_addr
+     * or ucode hash>. Reading a 69-instruction shader to guess which term
+     * carries a bad value is slower and less certain than displaying the terms.
+     * (RSX_FP_DEBUG, in the decompiler, shows a register as it stands after a
+     * given instruction.) */
+    /* FP_KILL=<hex fp_addr or ucode hash>: make that program discard every
+     * fragment, so what it covers becomes visible. Distinguishes "this surface
+     * shades black" from "this surface is correct and something else is
+     * missing behind it". */
+    if (fp_dbg_named("FP_KILL", fp_addr, uhash) && fp_dbg_discard(hlsl, sizeof hlsl))
+        fprintf(stderr, "[FPKILL] fp=0x%X ucode %08X discards%c", fp_addr, uhash, 10);
     { const char* sh = getenv("FP_SHOW");
-      const char* only = getenv("FP_TEX_FP");
-      if (sh && (!only || (u32)strtoul(only, NULL, 16) == fp_addr)) {
-          char* rp = strstr(hlsl, "_po.c0 = ");
-          if (rp) { char* semi = strchr(rp, ';');
-            if (semi) {
-                char rep[256];
-                snprintf(rep, sizeof rep, "_po.c0 = float4((%s).xyz, 1.0)", sh);
-                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
-                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
-                    memmove(rp + newlen, semi, tail);
-                    memcpy(rp, rep, newlen);
-                    fprintf(stderr, "[FPSHOW] fp=0x%X output replaced with %s%c",
-                            fp_addr, sh, 10);
-                }
-            } }
+      if (sh && (!getenv("FP_TEX_FP") || fp_dbg_named("FP_TEX_FP", fp_addr, uhash))) {
+          char rep[256];
+          snprintf(rep, sizeof rep, "float4((%s).xyz, 1.0)", sh);
+          if (fp_dbg_set_output(hlsl, sizeof hlsl, rep))
+              fprintf(stderr, "[FPSHOW] fp=0x%X ucode %08X output replaced with %s%c",
+                      fp_addr, uhash, sh, 10);
       } }
     /* Retarget the samplers the guest bound as CUBE textures. The decompiler
      * always emits 2D samplers; a cube is sampled with a 3-component direction
@@ -2771,73 +2789,43 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                     fp_addr, cube_mask, 10); }
     }
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
-     * from its address. One frame then shows which program paints which surface,
-     * instead of one run per candidate to test them by elimination. */
+     * from its code hash (not its address, which can change every frame). One
+     * frame then shows which program paints which surface, instead of one run
+     * per candidate to test them by elimination. */
     if (getenv("FP_IDCOLOR")) {
-        char* rp = strstr(hlsl, "_po.c0 = ");
-        if (rp) {
-            char* semi = strchr(rp, ';');
-            if (semi) {
-                /* Mix properly: every fp address in a title tends to share low
-                 * bits (they all end 0x01/0x81 here), so a single multiply left
-                 * one channel constant across all programs and made distinct
-                 * shaders look like the same colour. */
-                u32 hsh = fp_addr * 2654435761u;
-                hsh ^= hsh >> 13; hsh *= 0x5BD1E995u; hsh ^= hsh >> 15;
-                /* Force the top bit on in each channel: a hash that happens to
-                 * land near black is indistinguishable from "this surface was
-                 * never painted", which is the exact question the mode exists
-                 * to answer. */
-                float cr = (float)(((hsh >> 16) & 0x7F) | 0x80) / 255.0f;
-                float cg = (float)(((hsh >>  8) & 0x7F) | 0x80) / 255.0f;
-                float cb = (float)(((hsh      ) & 0x7F) | 0x80) / 255.0f;
-                char rep[128];
-                snprintf(rep, sizeof rep, "_po.c0 = float4(%.3f,%.3f,%.3f,1.0)", cr, cg, cb);
-                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
-                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
-                    memmove(rp + newlen, semi, tail);
-                    memcpy(rp, rep, newlen);
-                    fprintf(stderr, "[FPID] fp=0x%X -> rgb(%.0f,%.0f,%.0f)%c",
-                            fp_addr, cr*255, cg*255, cb*255, 10);
-                }
-            }
-        }
+        /* Mix properly: similar inputs must not share a channel value, or
+         * distinct shaders look like the same colour. */
+        u32 hsh = uhash * 2654435761u;
+        hsh ^= hsh >> 13; hsh *= 0x5BD1E995u; hsh ^= hsh >> 15;
+        /* Force the top bit on in each channel: a hash that happens to land
+         * near black is indistinguishable from "this surface was never
+         * painted", which is the exact question the mode exists to answer. */
+        float cr = (float)(((hsh >> 16) & 0x7F) | 0x80) / 255.0f;
+        float cg = (float)(((hsh >>  8) & 0x7F) | 0x80) / 255.0f;
+        float cb = (float)(((hsh      ) & 0x7F) | 0x80) / 255.0f;
+        char rep[128];
+        snprintf(rep, sizeof rep, "float4(%.3f,%.3f,%.3f,1.0)", cr, cg, cb);
+        if (fp_dbg_set_output(hlsl, sizeof hlsl, rep))
+            fprintf(stderr, "[FPID] fp=0x%X ucode %08X -> rgb(%.0f,%.0f,%.0f)%c",
+                    fp_addr, uhash, cr*255, cg*255, cb*255, 10);
     }
-    /* FP_TEX=<unit>: output that unit's sample verbatim. FP_TEX_FP=<hex> limits
-     * it to one program, so one surface can be inspected without repainting the
-     * whole scene. FP_TEX_UV=1 samples with the same texcoord the program uses
-     * for that unit rather than tc0. */
-    if (getenv("FP_TEX") && (!getenv("FP_TEX_FP") ||
-        (u32)strtoul(getenv("FP_TEX_FP"), NULL, 16) == fp_addr)) {
+    /* FP_TEX=<unit 0-15>: output that unit's sample verbatim, at the
+     * program's first texture coordinate (tc0). FP_TEX_FP=<hex fp_addr or
+     * ucode hash> limits it to one program, so one surface can be inspected
+     * without repainting the whole scene. FP_TEX_UV=1: sample at a fixed centre
+     * UV instead. If the texture is populated but the texcoords never arrive,
+     * the normal path samples texel (0,0) -- usually black -- and looks exactly
+     * like an empty texture. This tells the two apart. */
+    if (getenv("FP_TEX") && (!getenv("FP_TEX_FP") || fp_dbg_named("FP_TEX_FP", fp_addr, uhash))) {
         int _un = atoi(getenv("FP_TEX"));
-        if (_un < 0 || _un > 3) _un = 0;
-        char* rp = strstr(hlsl, "_po.c0 = ");
-        if (rp) {
-            char* semi = strchr(rp, ';');
-            if (semi) {
-                char rep[160];
-                /* FP_TEX_UV=1: sample at a fixed centre UV instead of the
-                 * interpolated texcoord. If the texture is populated but the
-                 * texcoords never arrive, the normal path samples texel (0,0)
-                 * -- usually black -- and looks exactly like an empty texture.
-                 * This tells the two apart. */
-                if (getenv("FP_TEX_UV"))
-                    snprintf(rep, sizeof rep,
-                             "_po.c0 = rsx_tex%d.Sample(rsx_samp%d, float2(0.5, 0.5))",
-                             _un, _un);
-                else
-                snprintf(rep, sizeof rep,
-                         "_po.c0 = rsx_tex%d.Sample(rsx_samp%d, input.tc0.xy * rsx_texscale[%d].xy)",
-                         _un, _un, _un);
-                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
-                fprintf(stderr, "[FP_TEX] program 0x%X rewritten to sample unit %d%c",
-                        fp_addr, _un, 10);
-                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
-                    memmove(rp + newlen, semi, tail);
-                    memcpy(rp, rep, newlen);
-                }
-            }
-        }
+        if (_un < 0 || _un > 15) _un = 0;
+        char tex[24], rep[160];
+        snprintf(tex, sizeof tex, strstr(hlsl, "rsx_tex[16]") ? "rsx_tex[%d]" : "rsx_tex%d", _un);
+        snprintf(rep, sizeof rep, "%s.Sample(rsx_samp[%d], %s)", tex, _un,
+                 getenv("FP_TEX_UV") ? "float2(0.5, 0.5)" : "input.tc0.xy");
+        if (fp_dbg_set_output(hlsl, sizeof hlsl, rep))
+            fprintf(stderr, "[FP_TEX] program 0x%X ucode %08X rewritten to sample unit %d%c",
+                    fp_addr, uhash, _un, 10);
     }
     /* FP_FORCE=1: replace the translated body with solid magenta -- isolates
      * geometry/transform problems from texture/blend problems. */
