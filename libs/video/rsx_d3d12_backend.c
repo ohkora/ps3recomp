@@ -1730,9 +1730,32 @@ static int cap_listed(const u32* only, int n, u32 off)
     return 0;
 }
 
+/* Up to max hex offsets from a comma-separated list (RSX_CAP_ONLY,
+ * RSX_CAP_KDIFF). */
+static int cap_parse_list(const char* e, u32* out, int max)
+{
+    int n = 0;
+    while (e && *e && n < max) {
+        char* end; out[n++] = (u32)strtoul(e, &end, 16);
+        if (end == e) { n--; break; }
+        e = (*end == ',') ? end + 1 : NULL;
+    }
+    return n;
+}
+
+/* One capture's state for the draws' content signatures. */
+typedef struct {
+    u32 kdiff[8]; int nkdiff;   /* RSX_CAP_KDIFF colour targets */
+    FILE* kdump;                /* RSX_CAP_KDUMP: frame_NN/kdump.bin, or NULL */
+    int kdump_all;              /* RSX_CAP_KDUMP=all: every VP draw */
+    u32 nseen;                  /* VP draws keyed so far (for occ=) */
+} CapSigCtx;
+
 /* A draw's content signatures for the capture manifest (defined with the VP
- * vertex layout, below). */
-static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 kdiff_rt, int* kdiff_n);
+ * vertex layout, below), and the end of a capture's signatures. */
+static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 op, CapSigCtx* cx);
+static void cap_kdump_begin(FILE* f, u32 capidx);
+static void cap_sig_end(void);
 
 static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
 {
@@ -1754,10 +1777,19 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 fprintf(mf, "offrt[%d] off=0x%08X %ux%u dxgi=%u\n", i, s_d3d.off_rt[i].off,
                         s_d3d.off_rt[i].w, s_d3d.off_rt[i].h, s_d3d.off_rt[i].dxgi);
         fprintf(mf, "--- ops ---\n");
-        /* RSX_CAP_KDIFF=<hex colour target>: see cap_draw_signature. */
-        const char* kd = getenv("RSX_CAP_KDIFF");
-        const u32 kdiff_rt = kd ? (u32)strtoul(kd, NULL, 16) : 0;
-        int kdiff_n = 0;
+        /* RSX_CAP_KDIFF=<hex>[,<hex>...] and RSX_CAP_KDUMP[=all]: see
+         * cap_draw_signature. */
+        CapSigCtx cx;
+        memset(&cx, 0, sizeof cx);
+        cx.nkdiff = cap_parse_list(getenv("RSX_CAP_KDIFF"), cx.kdiff, 8);
+        { const char* kd = getenv("RSX_CAP_KDUMP");
+          if (kd && *kd && *kd != '0') {
+              char kpath[512];
+              cx.kdump_all = !strcmp(kd, "all");
+              snprintf(kpath, sizeof kpath, "%s/kdump.bin", dir);
+              cx.kdump = fopen(kpath, "wb");
+              if (cx.kdump) cap_kdump_begin(cx.kdump, capidx);
+          } }
         for (u32 d = 0; d < ndraws && d < MAX_DRAWS; d++) {
             const D3D12DrawRecord* r = &s_d3d.draws[d];
             if (r->is_clear)
@@ -1778,9 +1810,11 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                                 (r->tex[u].fmt & 0x20) ? "LN" : "SZ",
                                 (r->tex[u].fmt & 0x40) ? ",NR" : "",
                                 r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF);
-                cap_draw_signature(mf, r, kdiff_rt, &kdiff_n);
+                cap_draw_signature(mf, r, d, &cx);
             }
         }
+        if (cx.kdump) fclose(cx.kdump);
+        cap_sig_end();
         /* Per-draw VP constant banks for the first few offscreen-RT geometry
          * draws: c[0..3] is the projection row-major for most CG VPs; also scan
          * for the largest non-zero slot so a mis-placed MVP is obvious. Records
@@ -1821,13 +1855,8 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
      * RSX_CAP_ONLY=<hex>[,<hex>...] writes only the RTs at those offsets, and
      * the backbuffer only if 0 is listed: a long series of captures of one
      * target then costs one image each. */
-    u32 only[8]; int nonly = 0;
-    { const char* e = getenv("RSX_CAP_ONLY");
-      while (e && *e && nonly < 8) {
-          char* end; only[nonly++] = (u32)strtoul(e, &end, 16);
-          if (end == e) { nonly--; break; }
-          e = (*end == ',') ? end + 1 : NULL;
-      } }
+    u32 only[8];
+    const int nonly = cap_parse_list(getenv("RSX_CAP_ONLY"), only, 8);
     if (cap_listed(only, nonly, 0)) {
         snprintf(path, sizeof path, "%s/backbuffer.bmp", dir);
         cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
@@ -2464,11 +2493,11 @@ static void vp_fp_remember(const VPFPEntry* key, ID3D12PipelineState* pso)
 }
 
 /* The FP_* debug switches in vp_get_fp_pso name a program by its address or
- * by its code hash: the pipeline key's ucode hash, which the "[FP] ... ucode"
- * lines and the switches' own lines print. A title that copies its patched
- * programs into a ring every frame draws each program from a new address, and
- * the pipeline is built once, at whichever address the program was first
- * seen, so only the hash names such a program reliably. */
+ * by its code hash: the pipeline key's ucode hash, which "[FP] ... ucode"
+ * lines and a capture's "prog" line (fph) print. A title that copies its
+ * patched programs into a ring every frame draws each program from a new
+ * address, and the pipeline is built once, at whichever address the program
+ * was first seen, so only the hash names such a program reliably. */
 static int fp_dbg_named(const char* env, u32 fp_addr, u32 uhash)
 {
     const char* v = getenv(env);
@@ -6527,19 +6556,107 @@ typedef struct { float v[4]; } VPSlot;
  *                 next bind uploads again; "!m" it misses it, so the draws
  *                 keep sampling the older contents; "?" no cached upload found
  *   t<u>=rt / ds  the unit samples an offscreen colour / depth surface
+ * and a "prog" line that says which draw of the next capture is the same one:
+ *   fph  the fragment program's code hash with its inline constants skipped
+ *        (rsx_fp_code_hash, the pipeline key's; the FP_* debug switches take
+ *        it). Not the address: a title that copies its patched programs into
+ *        a ring each frame (PlayStation All-Stars Battle Royale moves every
+ *        program 0x380 on per frame) draws the same program from a new
+ *        address every frame.
+ *   fps  its structural hash (rsx_fp_structural_hash), which RSX_FP_DEBUG takes
+ *   vsh  the vertex program's hash (0: the primary VS)
+ *   tk   the textures the program samples (unit, offset, format, size)
+ *   occ  how many earlier draws of this capture had the same fph, vsh and tk
  *
- * RSX_CAP_KDIFF=<hex colour target>: for the first CAP_KDIFF_OPS draws into
- * that target, "dvs"/"dfp" lines list the vertex / fragment constants that
- * differ from the same draw (same position among them, same program) of the
- * previous capture, up to 12 of each.
+ * RSX_CAP_KDIFF=<hex>[,<hex>...] (colour targets, 0 the display buffer): for
+ * the first CAP_KDIFF_OPS draws into them, "dvs"/"dfp" lines list the vertex /
+ * fragment constants that differ from the previous capture's draw with the
+ * same prog line, up to 12 of each.
+ *
+ * RSX_CAP_KDUMP=1 writes frame_NN/kdump.bin, every constant of those draws
+ * (of every VP draw without RSX_CAP_KDIFF, or with RSX_CAP_KDUMP=all), for
+ * tools/rsxcap_kdump.py to compare over a series: which registers keep one
+ * range in the frames that draw right and another in the frames that do not.
+ * About 8.6 KB a draw.
  * -----------------------------------------------------------------------*/
 #define CAP_KDIFF_OPS 64
-static struct cap_kd {
-    u32 fp_addr, nfp;
-    int have;
+struct cap_kd {
+    u32 fph, vsh, tk, occ, nfp;
     float vs[RSX_MAX_VERTEX_CONSTANTS * 4];
     float fp[(VP_FP_MAX_CONSTS + 1) * 4];
-} *s_cap_kd;
+};
+static struct cap_kd* s_cap_kd[2];   /* [0] the previous capture's draws, [1] this one's */
+static int s_cap_kd_n[2];
+static u32 s_cap_seen[MAX_DRAWS][3]; /* fph, vsh, tk of this capture's VP draws so far */
+
+/* kdump.bin, little-endian: a CapKdFile, then per draw a CapKdRec followed by
+ * vs_bytes of the draw's vertex constant slot as the shader read it
+ * (c[0..511], then the viewport epilogue vp_record_cb appends) and fp_bytes of
+ * its fragment constants (k[0..nfp-1], or one zero vec4 without any, then
+ * fp_alpha). tools/rsxcap_kdump.py reads it; change both together. */
+typedef struct {
+    char magic[4];          /* "KDMP" */
+    u32 version;            /* 1 */
+    u64 frame_count;
+    u32 capidx;
+    u32 rec_bytes;          /* sizeof(CapKdRec) */
+} CapKdFile;
+typedef struct {
+    char magic[4];          /* "KDR1" */
+    u32 op, rt_off, fp_addr, fph;
+    u32 fps_lo, fps_hi;     /* structural hash (RSX_FP_DEBUG) */
+    int vs_idx;
+    u32 vsh, tk, occ, nfp;
+    u32 vertex_count, blend_key, cmask, alpha_ctl, zeta_off;
+    u32 tex_off[16], tex_fmt[16];
+    u32 tex_kind[16];       /* 0 not sampled, 1 guest texture, 2 colour surface,
+                             * 3 depth surface, 4 depth surface's colour copy */
+    u32 vs_bytes, fp_bytes;
+} CapKdRec;
+
+static void cap_kdump_begin(FILE* f, u32 capidx)
+{
+    CapKdFile h;
+    memset(&h, 0, sizeof h);
+    memcpy(h.magic, "KDMP", 4);
+    h.version = 1;
+    h.frame_count = s_d3d.frame_count;
+    h.capidx = capidx;
+    h.rec_bytes = (u32)sizeof(CapKdRec);
+    fwrite(&h, sizeof h, 1, f);
+}
+
+/* The capture's KDIFF draws become the previous capture's. */
+static void cap_sig_end(void)
+{
+    if (!s_cap_kd[0] || !s_cap_kd[1]) return;
+    struct cap_kd* t = s_cap_kd[0];
+    s_cap_kd[0] = s_cap_kd[1]; s_cap_kd[1] = t;
+    s_cap_kd_n[0] = s_cap_kd_n[1]; s_cap_kd_n[1] = 0;
+}
+
+/* The program's code hash and structural hash (both skip the inline
+ * constants) and the units it samples. */
+static u32 cap_fp_code(u32 fp_addr, u32* units, u64* fps)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int, u32);
+    *units = 0; *fps = 0;
+    if (!fp_addr || !vm_base) return 0;
+    const u32 foff = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
+    if (foff == 0xFFFFFFFFu) return 0;
+    *units = rsx_fp_texture_units(vm_base + foff, VP_FP_MAX_BYTES);
+    *fps = rsx_fp_structural_hash(vm_base + foff, VP_FP_MAX_BYTES, 1469598103934665603ull);
+    return rsx_fp_code_hash(vm_base + foff, VP_FP_MAX_BYTES);
+}
+
+static u32 cap_tex_kind(const D3D12DrawRecord* r, int u)
+{
+    if (!r->tex[u].set) return 0;
+    if (r->tex_dz[u] >= 0) return 3;
+    if (r->tex_rt[u] >= 0) return r->tex_ds[u] >= 0 ? 4 : 2;
+    return 1;
+}
 
 /* The program's inline-constant count, which vp_record_cb wrote ahead of the
  * alpha reference. Patching changes the values, never the count. */
@@ -6568,7 +6685,7 @@ static void cap_kdiff(FILE* mf, const char* tag, const char* name, const float* 
     }
 }
 
-static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 kdiff_rt, int* kdiff_n)
+static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 op, CapSigCtx* cx)
 {
     extern uint8_t* vm_base;
     if (!r->is_vp) return;
@@ -6616,18 +6733,78 @@ static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 kdiff_rt,
     }
     fprintf(mf, "\n");
 
-    if (!kdiff_rt || r->rt_off != kdiff_rt || *kdiff_n >= CAP_KDIFF_OPS || !vsk) return;
-    if (!s_cap_kd && !(s_cap_kd = (struct cap_kd*)calloc(CAP_KDIFF_OPS, sizeof *s_cap_kd))) return;
-    struct cap_kd* k = &s_cap_kd[(*kdiff_n)++];
-    if (k->have && k->fp_addr == r->fp_addr) {
-        cap_kdiff(mf, "dvs", "c", vsk, k->vs, RSX_MAX_VERTEX_CONSTANTS);
-        if (fpk && k->nfp == nfp) cap_kdiff(mf, "dfp", "k", fpk, k->fp, (nfp ? nfp : 1u) + 1u);
-    } else if (k->have) {
-        fprintf(mf, "      dvs (previous capture drew program 0x%08X here)\n", k->fp_addr);
+    /* Which draw this is, in terms that hold from one frame to the next. */
+    u32 units = 0;
+    u64 fps = 0;
+    const u32 fph = cap_fp_code(r->fp_addr, &units, &fps);
+    const u32 vsh = (r->vs_idx >= 0 && r->vs_idx < s_d3d.vp_vs_n) ? s_d3d.vp_vs[r->vs_idx].hash : 0;
+    u32 tk = 2166136261u;
+    for (int u = 0; u < VP_TEX_UNITS; u++) {
+        if (!((units >> u) & 1u) || !r->tex[u].set) continue;
+        const u32 w[5] = { (u32)u, r->tex[u].off, r->tex[u].fmt, r->tex[u].w, r->tex[u].h };
+        for (int i = 0; i < 5; i++) { tk ^= w[i]; tk *= 16777619u; }
     }
-    memcpy(k->vs, vsk, sizeof k->vs);
-    if (fpk) memcpy(k->fp, fpk, ((nfp ? nfp : 1u) + 1u) * 16u);
-    k->fp_addr = r->fp_addr; k->nfp = nfp; k->have = 1;
+    u32 occ = 0;
+    for (u32 i = 0; i < cx->nseen; i++)
+        if (s_cap_seen[i][0] == fph && s_cap_seen[i][1] == vsh && s_cap_seen[i][2] == tk) occ++;
+    if (cx->nseen < MAX_DRAWS) {
+        s_cap_seen[cx->nseen][0] = fph; s_cap_seen[cx->nseen][1] = vsh; s_cap_seen[cx->nseen][2] = tk;
+        cx->nseen++;
+    }
+    fprintf(mf, "      prog fph=%08X fps=%016llX vsh=%08X tk=%08X occ=%u\n",
+            fph, (unsigned long long)fps, vsh, tk, occ);
+
+    const int target = cx->nkdiff && cap_listed(cx->kdiff, cx->nkdiff, r->rt_off);
+    const u32 fpn = ((nfp ? nfp : 1u) + 1u);   /* vec4s in the b1 slot */
+    if (cx->kdump && vsk && (cx->kdump_all || !cx->nkdiff || target)) {
+        CapKdRec h;
+        memset(&h, 0, sizeof h);
+        memcpy(h.magic, "KDR1", 4);
+        h.op = op; h.rt_off = r->rt_off; h.fp_addr = r->fp_addr; h.fph = fph;
+        h.fps_lo = (u32)fps; h.fps_hi = (u32)(fps >> 32);
+        h.vs_idx = r->vs_idx; h.vsh = vsh; h.tk = tk; h.occ = occ; h.nfp = nfp;
+        h.vertex_count = r->vertex_count; h.blend_key = r->blend_key;
+        h.cmask = r->cmask; h.alpha_ctl = r->alpha_ctl; h.zeta_off = r->zeta_off;
+        for (int u = 0; u < VP_TEX_UNITS && u < 16; u++) {
+            if (!((units >> u) & 1u)) continue;
+            h.tex_kind[u] = cap_tex_kind(r, u);
+            if (h.tex_kind[u]) { h.tex_off[u] = r->tex[u].off; h.tex_fmt[u] = r->tex[u].fmt; }
+        }
+        h.vs_bytes = VP_CB_STRIDE;
+        h.fp_bytes = fpk ? fpn * 16u : 0;
+        fwrite(&h, sizeof h, 1, cx->kdump);
+        fwrite(vsk, VP_CB_STRIDE, 1, cx->kdump);
+        if (fpk) fwrite(fpk, fpn * 16u, 1, cx->kdump);
+    }
+
+    if (!target || !vsk) return;
+    if (!s_cap_kd[0]) {
+        s_cap_kd[0] = (struct cap_kd*)calloc(CAP_KDIFF_OPS, sizeof **s_cap_kd);
+        s_cap_kd[1] = (struct cap_kd*)calloc(CAP_KDIFF_OPS, sizeof **s_cap_kd);
+        if (!s_cap_kd[0] || !s_cap_kd[1]) {
+            free(s_cap_kd[0]); free(s_cap_kd[1]);
+            s_cap_kd[0] = s_cap_kd[1] = NULL;
+            return;
+        }
+    }
+    const struct cap_kd* was = NULL;
+    for (int i = 0; i < s_cap_kd_n[0] && !was; i++) {
+        const struct cap_kd* p = &s_cap_kd[0][i];
+        if (p->fph == fph && p->vsh == vsh && p->tk == tk && p->occ == occ) was = p;
+    }
+    if (was) {
+        cap_kdiff(mf, "dvs", "c", vsk, was->vs, RSX_MAX_VERTEX_CONSTANTS);
+        if (fpk && was->nfp == nfp) cap_kdiff(mf, "dfp", "k", fpk, was->fp, fpn);
+    } else if (s_cap_kd_n[0]) {
+        fprintf(mf, "      dvs (the previous capture has no draw with this prog line)\n");
+    }
+    if (s_cap_kd_n[1] < CAP_KDIFF_OPS) {
+        struct cap_kd* k = &s_cap_kd[1][s_cap_kd_n[1]++];
+        k->fph = fph; k->vsh = vsh; k->tk = tk; k->occ = occ; k->nfp = nfp;
+        memcpy(k->vs, vsk, sizeof k->vs);
+        if (fpk) memcpy(k->fp, fpk, fpn * 16u);
+        else memset(k->fp, 0, sizeof k->fp);
+    }
 }
 
 
