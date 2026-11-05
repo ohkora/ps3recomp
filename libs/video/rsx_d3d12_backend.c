@@ -159,6 +159,8 @@ typedef struct {
     int no_color;       /* colour target NONE with a depth surface: a depth-only pass */
     int tex_ds[VP_TEX_UNITS];   /* pre-pass: OffDS read through unit u (its colour copy is tex_rt), -1 = none */
     int tex_dz[VP_TEX_UNITS];   /* pre-pass: OffDS a depth-format unit u reads directly, -1 = none */
+    u32 tex_cube_srv;   /* pre-pass: units bound through a TEXTURECUBE view; the program
+                         * is compiled with exactly these units declared TextureCube */
     /* Guest viewport rect at draw time (target pixels). Sub-viewport layouts
      * (wave's debug tiles) position quads with this, not with constants --
      * forcing full-target viewports drew every tile window-sized. */
@@ -2318,23 +2320,11 @@ static int dr_num_rts(const D3D12DrawRecord* dr)
     return n;
 }
 
-/* Replace every occurrence of `find` with `repl` inside a NUL-terminated buffer,
- * shifting the tail. Used to retarget generated HLSL (2D sampler -> cube). */
-static void hlsl_replace_all(char* buf, size_t cap, const char* find, const char* repl)
-{
-    size_t fl = strlen(find), rl = strlen(repl);
-    if (!fl) return;
-    char* at = buf;
-    while ((at = strstr(at, find)) != NULL) {
-        size_t used = strlen(buf) + 1;
-        if (used + rl - fl > cap) return;
-        memmove(at + rl, at + fl, used - (size_t)(at - buf) - fl);
-        memcpy(at, repl, rl);
-        at += rl;
-    }
-}
-
-/* Which of a draw's texture units are cube textures, as a 4-bit mask. */
+/* Which of a draw's texture units are cube textures, as a 16-bit mask: the
+ * units whose guest texture is uploaded as six faces behind a TEXTURECUBE view.
+ * The program is compiled with the units that actually got that view
+ * (dr->tex_cube_srv), not with this mask: a cube unit that resolves to a render
+ * target, a depth surface or nothing gets a 2D view. */
 static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 {
     /* ON by default (RSX_CUBE_TEX=0 to disable). This was off while the cube path
@@ -2346,11 +2336,8 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     static int en = -1;
     if (en < 0) { const char* e = getenv("RSX_CUBE_TEX"); en = e ? atoi(e) : 1; }
     if (!en) return 0;
-    /* Units 0-3 only, as the HLSL retarget in vp_get_fp_pso: a cube bound at a
-     * higher unit is sampled through a 2D view of its first face, which is what
-     * the decompiler's Texture2D declaration of that unit expects. */
     u32 m = 0;
-    for (int u = 0; u < 4; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
+    for (int u = 0; u < VP_TEX_UNITS; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
     return m;
 }
 
@@ -2596,8 +2583,17 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* Units with a depth comparison sample through _rsx_shadowN(), which reads
      * the depth from .r of the bound depth surface and compares it with the
      * coordinate's z. A layout the decompiler cannot compare fails the build. */
+    /* cube_mask: the units the draw binds through a TEXTURECUBE view
+     * (dr->tex_cube_srv). The decompiler then declares each unit on its own,
+     * those as TextureCube, and samples them with the .xyz direction. Before,
+     * it was always given 0: every unit was declared in one Texture2D array and
+     * sampled with .xy, while a cube unit had a TEXTURECUBE view behind it. A
+     * view whose dimension differs from the declaration is undefined in D3D12,
+     * and an environment or ambient cube term read nothing. The retarget that
+     * used to follow looked for a declaration and a coordinate this decompiler
+     * never emits, so it changed nothing. */
     u32 nconst = 0;
-    int n = rsx_fp_decompile_buffered_shadow_ex(vm_base + off, VP_FP_MAX_BYTES, fp_ctrl, 0u,
+    int n = rsx_fp_decompile_buffered_shadow_ex(vm_base + off, VP_FP_MAX_BYTES, fp_ctrl, cube_mask,
                                                 scmp ? sd : NULL,
                                                 hlsl, sizeof(hlsl), &nconst);
     const char* why = NULL;
@@ -2713,28 +2709,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                 }
             } }
       } }
-    /* Retarget the samplers the guest bound as CUBE textures. The decompiler
-     * always emits 2D samplers; a cube is sampled with a 3-component direction
-     * and no texel-scale, and the emitted coordinate always ends in the fixed
-     * tail ".xy * rsx_texscale[N].xy", so both edits are exact replacements. */
-    if (cube_mask) {
-        for (int _u = 0; _u < 4; _u++) {
-            if (!(cube_mask & (1u << _u))) continue;
-            char f1[64], r1[64], f2[64], r2[64];
-            snprintf(f1, sizeof f1, "Texture2D    rsx_tex%d", _u);
-            snprintf(r1, sizeof r1, "TextureCube  rsx_tex%d", _u);
-            hlsl_replace_all(hlsl, sizeof hlsl, f1, r1);
-            snprintf(f1, sizeof f1, "Texture2D rsx_tex%d", _u);
-            snprintf(r1, sizeof r1, "TextureCube rsx_tex%d", _u);
-            hlsl_replace_all(hlsl, sizeof hlsl, f1, r1);
-            snprintf(f2, sizeof f2, ".xy * rsx_texscale[%d].xy", _u);
-            snprintf(r2, sizeof r2, ".xyz");
-            hlsl_replace_all(hlsl, sizeof hlsl, f2, r2);
-        }
-        { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
-            fprintf(stderr, "[CUBE] fp=0x%X compiled with cube units mask 0x%X%c",
-                    fp_addr, cube_mask, 10); }
-    }
+    if (cube_mask) { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
+        fprintf(stderr, "[CUBE] fp=0x%X compiled with cube units mask 0x%X%c",
+                fp_addr, cube_mask, 10); }
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
      * from its address. One frame then shows which program paints which surface,
      * instead of one run per candidate to test them by elimination. */
@@ -4996,6 +4973,7 @@ static void render_frame(void)
          * resolves to an offscreen RT (sampled directly), an uploaded guest
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
+        dr->tex_cube_srv = 0;
         for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * VP_TEX_UNITS + (u32)_u;
             dr->tex_rt[_u] = -1;
@@ -5116,6 +5094,7 @@ static void render_frame(void)
                                   (_bf == 0x81) ? 0x1000
                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
                                   _cube);
+                        if (_cube) dr->tex_cube_srv |= 1u << _u;
                         continue;
                     }
                 }
@@ -5139,7 +5118,7 @@ static void render_frame(void)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr),
+                                       dr->fp_ctrl, dr->cmask, dr->cull, dr->tex_cube_srv,
                                        dr->zs_key, dr_alpha_func(dr), dr_shadow_descs(dr, _sd));
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
@@ -5536,7 +5515,7 @@ static void render_frame(void)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_ctrl, dr->cmask, dr->cull,
-                                                dr_cube_mask(dr), dr->zs_key,
+                                                dr->tex_cube_srv, dr->zs_key,
                                                 dr_alpha_func(dr), dr_shadow_descs(dr, _sd)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);

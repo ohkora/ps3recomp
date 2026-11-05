@@ -360,6 +360,68 @@ int main(void)
         check("vol_none", hlsl, "rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)");
     }
 
+    /* Cube units through rsx_fp_decompile_buffered_shadow_ex, the call the
+     * D3D12 guest-FP path makes with the units it binds through a TEXTURECUBE
+     * view. Each unit is declared on its own at its t-register: the cube unit
+     * as TextureCube, sampled with the .xyz direction (TXP too: no divide);
+     * the others stay Texture2D and sample .xy. A depth-comparison unit in the
+     * same program keeps its helper. Given 0, as that path used to pass, the
+     * cube unit was a Texture2D array element sampled with .xy. */
+    {
+        u8 prog[48];
+        u32 nk = 0;
+        rsx_fp_shadow_desc sd[16];
+        memset(sd, 0, sizeof sd);
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | OUTREG(1) | INSRC(4) | TEXU(1)); /* TEX r1, TC0, unit 1 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x17) | OUTMASK_ALL | OUTREG(2) | INSRC(5) | TEXU(0)); /* TEX r2, TC1, unit 0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        put_word(prog + 32, OPC(0x03) | OUTMASK_ALL | END);                           /* ADD r0, r1, r2 */
+        put_word(prog + 36, T_TEMP | REG(1) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 40, T_TEMP | REG(2) | SWZ_IDENT);
+        put_word(prog + 44, 0);
+        int n = rsx_fp_decompile_buffered_shadow_ex(prog, sizeof prog, CTRL_32BIT, 1u << 1, NULL,
+                                                    hlsl, sizeof hlsl, &nk);
+        check_true("cube_decompiles", n > 0);
+        check("cube_decl",        hlsl, "TextureCube rsx_tex1 : register(t1);");
+        check("cube_2d_decl",     hlsl, "Texture2D   rsx_tex0 : register(t0);");
+        check("cube_2d_decl_top", hlsl, "Texture2D   rsx_tex15 : register(t15);");
+        check_absent("cube_no_array", hlsl, "rsx_tex[");
+        check("cube_sample",      hlsl, "rsx_tex1.Sample(rsx_samp[1], ((input.tc0).xyzw).xyz)");
+        check("cube_2d_sample",   hlsl, "rsx_tex0.Sample(rsx_samp[0], ((input.tc1).xyzw).xy)");
+
+        put_word(prog + 0, OPC(0x18) | OUTMASK_ALL | OUTREG(1) | INSRC(4) | TEXU(1)); /* TXP r1, TC0, unit 1 */
+        rsx_fp_decompile_buffered_shadow_ex(prog, sizeof prog, CTRL_32BIT, 1u << 1, NULL,
+                                            hlsl, sizeof hlsl, &nk);
+        check("cube_txp", hlsl, "rsx_tex1.Sample(rsx_samp[1], ((input.tc0).xyzw).xyz)");
+        check_absent("cube_txp_no_divide", hlsl, "((input.tc0).xyzw).xyz / ");
+
+        /* Unit 0 compared against a D24 depth surface, unit 1 a cube. */
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | OUTREG(1) | INSRC(4) | TEXU(1)); /* TEX r1, TC0, unit 1 */
+        rsx_fp_shadow_desc_from_texture(&sd[0], 0x90, 2, 0, 1, 0x01010000, 3u << 28, 0x80000000);
+        check_true("cube_shadow_desc", sd[0].enabled == 1);
+        n = rsx_fp_decompile_buffered_shadow_ex(prog, sizeof prog, CTRL_32BIT, 1u << 1, sd,
+                                                hlsl, sizeof hlsl, &nk);
+        check_true("cube_shadow_decompiles", n > 0);
+        check("cube_shadow_call",   hlsl, "_rsx_shadow0(((input.tc1).xyzw).xyz)");
+        check("cube_shadow_helper", hlsl, "float4 _rsx_shadow0(float3 coordinate)");
+        check("cube_shadow_cube",   hlsl, "rsx_tex1.Sample(rsx_samp[1], ((input.tc0).xyzw).xyz)");
+        check_absent("cube_shadow_no_array", hlsl, "rsx_tex[");
+
+        /* No cube units: one array and .xy, the same text as the plain call. */
+        static char plain[16384];
+        rsx_fp_decompile_buffered_shadow_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL,
+                                            hlsl, sizeof hlsl, &nk);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, plain, sizeof plain, &nk);
+        check_true("cube_none_unchanged", strcmp(plain, hlsl) == 0);
+        check("cube_none_array",  hlsl, "Texture2D    rsx_tex[16] : register(t0);");
+        check("cube_none_sample", hlsl, "rsx_tex[1].Sample(rsx_samp[1], ((input.tc0).xyzw).xy)");
+    }
+
     /* A 4096-byte program fits the D3D12 caller's input bound, but its
      * predicated, CC-writing instructions expand beyond 32 KiB of HLSL.
      * Assemble it here instead of depending on a captured game shader. */
