@@ -498,6 +498,23 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        /* A pending interrupt is taken before the next instruction, as on
+         * hardware. Lifted code takes it at its next transfer, in the drain
+         * loop; code running here makes no transfer to wait for, and an
+         * interrupts-enabled window can be a single instruction: the WWS job
+         * manager branches with `bie` straight onto a `bid` and relies on its
+         * DMA-list stall-and-notify handler running between the two. Without
+         * this check a job manager running here never took that interrupt, its
+         * list stayed parked, and the job it was loading never ran.
+         * spu_take_interrupt saves the registers and vectors through LS 0; a
+         * handler with a lift is then reached through the rejoin above, and an
+         * iret run here restores the registers (SPU_iret in spu_step). Not
+         * taken (no branch at LS 0): carry on, as the drain loop does. */
+        if (__builtin_expect(ctx->int_enable != 0, 0) &&
+            (__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask)) {
+            spu_take_interrupt(ctx, NULL);
+            if (!ctx->int_enable) continue;   /* taken: ctx->pc is the handler */
+        }
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

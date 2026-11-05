@@ -22,6 +22,8 @@ uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c;(void)ch; return 1; }
 int g_spu_ls_watch_n, g_spu_ls_probe, g_wws_read_probe, g_wws_code_probe, g_spu_smc_watch;
 spu_lifted_fn spu_lifted_lookup(const spu_context* c, uint32_t a) { (void)c;(void)a; return 0; }
 void spu_spurs_taskset_syscall(spu_context* c) { (void)c; }
+/* No interrupt is ever pending here (the event mask stays 0): not taken. */
+void (*spu_take_interrupt(spu_context* c, void (*tf)(spu_context*)))(spu_context*) { (void)c; return tf; }
 void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_t lr) { (void)l;(void)w;(void)p;(void)pc;(void)lr; }
 
 /* .text of the assembled snippet (big-endian words, verbatim). */
