@@ -376,13 +376,20 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * stack. */
     ctx.gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
     /* Word 1 of $sp is the SPU ABI's available stack space: the bytes
-     * between $sp and the lowest address the stack may reach, here the end
-     * of the scratch area that shares its block. Every frame's `ai $sp,
-     * $sp, -n` takes n off both words, and code built with stack checking
-     * halts as soon as word 1 goes negative. Left at 0, the first checked
-     * prologue of PlayStation All-Stars Battle Royale's job took it to -96
-     * and halted before the job did any work. */
-    ctx.gpr[1]._u32[1] = ctx.gpr[1]._u32[0] - (s_ls + size_scr);
+     * between $sp and the lowest address the stack may reach. Every frame's
+     * `ai $sp, $sp, -n` takes n off both words, and code built with stack
+     * checking halts as soon as word 1 goes negative. Left at 0, the first
+     * checked prologue of PlayStation All-Stars Battle Royale's job took it
+     * to -96 and halted before the job did any work.
+     *
+     * The limit stops one quadword above the end of the scratch area that
+     * shares the block. A job whose type asks for a memory check (bit 0x02)
+     * has its crt write a 0xDEADBEEF guard into the quadword just below the
+     * limit, and check it when the job ends. With the limit at the end of
+     * scratch, that quadword was the last one of the job's own scratch: the
+     * same game's loading-screen job wrote it, failed the check, printed
+     * "memory corruption" and stopped there, without the rest of its work. */
+    ctx.gpr[1]._u32[1] = ctx.gpr[1]._u32[0] - (s_ls + size_scr + 16u);
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */

@@ -24,6 +24,14 @@
  * it goes negative. PlayStation All-Stars Battle Royale's job halted in its
  * first checked prologue because the runner left the word at 0.
  *
+ * Last, the entry does what the job crt does when the job's type asks for a
+ * memory check: it writes 0xDEADBEEF into the quadword just below the stack
+ * limit ($sp word 0 minus word 1), lets the job use all of its scratch, and
+ * then checks the guard. The limit must therefore leave that quadword outside
+ * scratch. When it was the end of scratch, the guard was scratch's last
+ * quadword, and the same game's loading-screen job overwrote it and stopped
+ * with "memory corruption".
+ *
  * Build:
  *   clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
  *         -o /tmp/test_spurs_job_stack \
@@ -106,8 +114,16 @@ static void build_job(uint16_t stack_qw, uint16_t scratch_qw)
 }
 
 /* What the entry saw. */
-static int      g_ran, g_cache_intact, g_frames_in_stack;
-static uint32_t g_cache_ls, g_sp, g_avail, g_scratch_ls;
+static int      g_ran, g_cache_intact, g_frames_in_stack, g_guard_intact;
+static uint32_t g_cache_ls, g_sp, g_avail, g_scratch_ls, g_guard;
+static uint32_t g_scratch_bytes;   /* the case's sizeScratch, in bytes */
+
+static void ls_put32(spu_context* ctx, uint32_t lsa, uint32_t v)
+{
+    uint8_t* p = ctx->ls + (lsa & SPU_LS_MASK);
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
 
 /* The prologue every SPU function starts with: save $lr in the caller's
  * frame, then push a frame of its own and store the back chain. */
@@ -130,14 +146,24 @@ static void job_entry(spu_context* ctx)
     /* Both frames, and the caller's save area above the first, lie below the
      * cache buffer. */
     g_frames_in_stack = sp + 32u <= g_cache_ls && nsp < sp;
+
+    /* The memory check of the job crt: a guard in the quadword just below the
+     * stack limit, then the job's work, here all of its scratch, then the
+     * check. */
+    g_guard = (sp - g_avail - 16u) & ~15u;
+    for (uint32_t i = 0; i < 16; i += 4)
+        ls_put32(ctx, g_guard + i, 0xDEADBEEFu);
+    memset(ctx->ls + (g_scratch_ls & SPU_LS_MASK), 0x5A, g_scratch_bytes);
+    g_guard_intact = ls_get32(ctx, g_guard) == 0xDEADBEEFu;
 }
 
 static void run_case(const char* name, uint16_t stack_qw, uint16_t scratch_qw)
 {
     TEST(name);
     build_job(stack_qw, scratch_qw);
-    g_ran = g_cache_intact = g_frames_in_stack = 0;
-    g_avail = g_scratch_ls = 0;
+    g_ran = g_cache_intact = g_frames_in_stack = g_guard_intact = 0;
+    g_avail = g_scratch_ls = g_guard = 0;
+    g_scratch_bytes = (uint32_t)scratch_qw << 4;
     spu_run_spurs_job(job_entry, 7, JOB_EA, 256);
     CHECK(g_ran);
     CHECK(g_cache_intact);
@@ -145,16 +171,24 @@ static void run_case(const char* name, uint16_t stack_qw, uint16_t scratch_qw)
     if (!g_cache_intact || !g_frames_in_stack)
         fprintf(stderr, "  $sp=0x%05X cacheBuffer[0]=0x%05X\n", g_sp, g_cache_ls);
 
-    /* Available stack: down to the end of the scratch area, no further. */
+    /* Available stack: down to one quadword above the end of the scratch
+     * area, which holds the memory-check guard. */
     const uint32_t stack_bytes = stack_qw ? (uint32_t)stack_qw << 4 : 8192u;
     const uint32_t scratch_end = g_scratch_ls + ((uint32_t)scratch_qw << 4);
     CHECK((int32_t)g_avail > 0);
-    CHECK(g_avail == g_sp - scratch_end);
-    /* The whole requested stack, less the caller's 32-byte frame, fits. */
-    CHECK(g_avail >= stack_bytes - 32u);
-    if ((int32_t)g_avail <= 0 || g_avail != g_sp - scratch_end)
+    CHECK(g_avail == g_sp - scratch_end - 16u);
+    /* The whole requested stack fits, less the caller's 32-byte frame and the
+     * guard quadword. */
+    CHECK(g_avail >= stack_bytes - 48u);
+    if ((int32_t)g_avail <= 0 || g_avail != g_sp - scratch_end - 16u)
         fprintf(stderr, "  $sp=0x%05X avail=0x%X scratch end=0x%05X\n",
                 g_sp, g_avail, scratch_end);
+    /* The guard lies outside scratch and survives the job's use of it. */
+    CHECK(g_guard >= scratch_end);
+    CHECK(g_guard_intact);
+    if (g_guard < scratch_end || !g_guard_intact)
+        fprintf(stderr, "  guard=0x%05X scratch=0x%05X..0x%05X intact=%d\n",
+                g_guard, g_scratch_ls, scratch_end, g_guard_intact);
 }
 
 int main(void)
