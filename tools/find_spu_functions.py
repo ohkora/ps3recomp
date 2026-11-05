@@ -13,7 +13,10 @@ Seeds the function set from these sources (detect_functions has the rest):
   4. Static constructor/destructor lists (.ctors, .dtors, .init_array ...),
      which name functions nothing in the code branches to
      (see collect_ctor_list_targets).
-  5. Addresses loaded into $r0 by `il`/`ila` -- the link-register resume
+  5. Code that follows a function's end, between two seeds, which nothing
+     references at all: C++ virtual methods reached only through vtables
+     built at run time (see collect_uncovered_code_starts).
+  6. Addresses loaded into $r0 by `il`/`ila` -- the link-register resume
      idiom (see collect_link_register_targets).
 
 For each function start without a symbol-provided size, the end is
@@ -685,6 +688,97 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
     return min(next_start, code_end)
 
 
+# What the assembler pads code alignment with.
+_CODE_PADDING = {"nop", "lnop"}
+
+
+def _ends_fallthrough(ins):
+    """find_end's terminator test: a return or a non-resuming unconditional."""
+    return is_return(ins) or (ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH
+                              and not is_resuming_stop(ins))
+
+
+def _walk_end(start, limit, insns_by_addr):
+    """find_end with the next start already known."""
+    pc = start
+    while pc < limit:
+        ins = insns_by_addr.get(pc)
+        if ins is None:
+            return limit
+        if _ends_fallthrough(ins):
+            return pc + 4
+        pc += 4
+    return limit
+
+
+def _looks_like_function(start, limit, insns_by_addr):
+    """Does `start` begin real code that ends the way functions end?
+
+    Words in an executable segment that are not code still mostly decode (1.0f
+    is `rotqbyi`, -1 is `fms`), so decoding alone proves nothing. Require a
+    first instruction that is neither undecodable nor `stop` (zero words decode
+    as `stop 0`), then a run to a return or an unconditional branch with no
+    undecodable word and no terminal stop on the way. Running into `limit`
+    without such an end is rejected too: compiled functions do not fall
+    through into the next one.
+    """
+    first = insns_by_addr.get(start)
+    if first is None or first.mnemonic in (".word", "stop", "stopd"):
+        return False
+    pc = start
+    while pc < limit:
+        ins = insns_by_addr.get(pc)
+        if ins is None or ins.mnemonic == ".word":
+            return False
+        if ins.mnemonic in ("stop", "stopd") and not is_resuming_stop(ins):
+            return False
+        if is_return(ins) or ins.mnemonic in ("br", "bra", "iret"):
+            return True
+        pc += 4
+    return False
+
+
+def collect_uncovered_code_starts(sorted_starts, sized_by_start, insns_by_addr):
+    """Functions after another function's end that nothing branches to.
+
+    find_end closes a function at its first return (or another instruction
+    that does not fall through), so the words after it belong to no function
+    until the next seed. When those words are alignment padding and then code,
+    that code is a function nothing in the image branches to or names: a C++
+    virtual method, typically, whose address exists only in a vtable the
+    program fills in at run time. Unseeded, it is never lifted, every call to
+    it misses in spu_indirect_branch, and the runtime can only end the task or
+    interpret it.
+    Observed: a SPURS task image in PlayStation All-Stars Battle Royale calls
+    such methods through `bisl $r0,<reg>` after loading the vtable entry from
+    an object it fetched by DMA. Sixteen distinct targets missed in one run,
+    most of them between 0x22D38 and 0x23358, each right after another
+    function's `bi $r0; lnop` (0x22D48 is a bare `bi $r0`: an empty method).
+    Interpreting them lost track of the callers' frames, and two of the five
+    tasks the title waits for never finished.
+
+    Each gap is walked from the end of the function before it: skip padding,
+    take the next instruction if _looks_like_function, continue after that
+    function's end, until the gap's next seed. Only gaps between two seeds
+    are searched; past the last one the executable segment often holds
+    .rodata. Existing functions keep their extents: this only adds starts in
+    code no function covered.
+    """
+    found = []
+    for i in range(len(sorted_starts) - 1):
+        start, nxt = sorted_starts[i], sorted_starts[i + 1]
+        end = sized_by_start.get(start) or _walk_end(start, nxt, insns_by_addr)
+        while end < nxt:
+            a = end
+            while a < nxt and getattr(insns_by_addr.get(a), "mnemonic", None) in _CODE_PADDING:
+                a += 4
+            if a >= nxt or not _looks_like_function(a, nxt, insns_by_addr):
+                break
+            found.append(a)
+            end = _walk_end(a, nxt, insns_by_addr)
+    return found
+
+
 def detect_functions(buf, base_override=None, verbose=True, raw=False):
     if raw:
         # A raw local-store image: a SPURS job binary, which the title loads
@@ -758,6 +852,21 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
 
     sorted_starts = sorted(seed_starts)
     sized_by_start = {s: e for (s, e) in sized_funcs}
+
+    # Code nothing references, between functions (see
+    # collect_uncovered_code_starts). A raw job blob mixes code and data more
+    # freely, so it is left to the explicit seeds.
+    if not raw:
+        gap_starts = collect_uncovered_code_starts(sorted_starts, sized_by_start,
+                                                   insns_by_addr)
+        if gap_starts:
+            seed_starts.update(gap_starts)
+            sorted_starts = sorted(seed_starts)
+            if verbose:
+                shown = ", ".join(f"0x{a:X}" for a in gap_starts[:24])
+                more = f", ... ({len(gap_starts) - 24} more)" if len(gap_starts) > 24 else ""
+                print(f"  {len(gap_starts)} uncovered code start(s) after a "
+                      f"function end: {shown}{more}")
 
     # ---- end discovery ----
     funcs = []
