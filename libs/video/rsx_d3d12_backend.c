@@ -702,14 +702,23 @@ static HWND create_window(u32 width, u32 height, const char* title)
  * D3D12 initialization
  * -----------------------------------------------------------------------*/
 
-/* D3D12_VSYNC=0: present without waiting for the vblank, for measuring a title
- * past the display's rate. Read once. */
-static int d3d12_vsync_off(void)
+/* D3D12_VSYNC sets the present's sync interval, read once:
+ *   0     present without waiting for the vblank, for measuring a title past
+ *         the display's rate;
+ *   2..4  present on every 2nd..4th vblank. A title that paces itself on its
+ *         flips then runs at a half..quarter of the display's rate, and the
+ *         GPU does that much less work: a lighter load for long test runs;
+ *   unset, 1 or anything else: every vblank. Only the first character counts. */
+static int d3d12_sync_interval(void)
 {
-    static int off = -1;
-    if (off < 0) { const char* e = getenv("D3D12_VSYNC"); off = e && *e == '0'; }
-    return off;
+    static int n = -1;
+    if (n < 0) {
+        const char* e = getenv("D3D12_VSYNC");
+        n = (e && *e >= '0' && *e <= '4') ? *e - '0' : 1;
+    }
+    return n;
 }
+static int d3d12_vsync_off(void) { return d3d12_sync_interval() == 0; }
 
 static int init_d3d12(u32 width, u32 height)
 {
@@ -5839,11 +5848,13 @@ skip_dump_consider: ;
         }
       } }
 
-    /* Present, on the vblank unless D3D12_VSYNC=0: that one is for measuring a
-     * title past the display's rate. Skipped for an offscreen-only batch. */
+    /* Present, on the vblank (every Nth one with D3D12_VSYNC=2..4) unless
+     * D3D12_VSYNC=0: that one is for measuring a title past the display's
+     * rate. Skipped for an offscreen-only batch. */
     if (s_present_this_frame) {
         if (!d3d12_vsync_off())
-            s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+            s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain,
+                                              (UINT)d3d12_sync_interval(), 0);
         else
             s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,
                                               s_d3d.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
