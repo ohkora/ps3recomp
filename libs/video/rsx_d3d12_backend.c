@@ -6568,10 +6568,11 @@ typedef struct { float v[4]; } VPSlot;
  *   tk   the textures the program samples (unit, offset, format, size)
  *   occ  how many earlier draws of this capture had the same fph, vsh and tk
  *
- * RSX_CAP_KDIFF=<hex>[,<hex>...] (colour targets, 0 the display buffer): for
- * the first CAP_KDIFF_OPS draws into them, "dvs"/"dfp" lines list the vertex /
- * fragment constants that differ from the previous capture's draw with the
- * same prog line, up to 12 of each.
+ * RSX_CAP_KDIFF=<hex>[,<hex>...] (colour targets, 0 the display buffer; a
+ * depth-only pass, colour target NONE, counts by its depth surface, so a
+ * shadow map's offset takes its pass): for the first CAP_KDIFF_OPS draws into
+ * them, "dvs"/"dfp" lines list the vertex / fragment constants that differ
+ * from the previous capture's draw with the same prog line, up to 12 of each.
  *
  * RSX_CAP_KDUMP=1 writes frame_NN/kdump.bin, every constant of those draws
  * (of every VP draw without RSX_CAP_KDIFF, or with RSX_CAP_KDUMP=all), for
@@ -6603,7 +6604,9 @@ typedef struct {
 } CapKdFile;
 typedef struct {
     char magic[4];          /* "KDR1" */
-    u32 op, rt_off, fp_addr, fph;
+    u32 op;
+    u32 rt_off;             /* the colour target; the depth surface of a depth-only pass */
+    u32 fp_addr, fph;
     u32 fps_lo, fps_hi;     /* structural hash (RSX_FP_DEBUG) */
     int vs_idx;
     u32 vsh, tk, occ, nfp;
@@ -6754,13 +6757,16 @@ static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 op, CapSi
     fprintf(mf, "      prog fph=%08X fps=%016llX vsh=%08X tk=%08X occ=%u\n",
             fph, (unsigned long long)fps, vsh, tk, occ);
 
-    const int target = cx->nkdiff && cap_listed(cx->kdiff, cx->nkdiff, r->rt_off);
+    /* The draw's target: its colour target, or its depth surface in a
+     * depth-only pass (whose colour offset is whatever was set last). */
+    const u32 tgt = r->no_color ? r->zeta_off : r->rt_off;
+    const int target = cx->nkdiff && cap_listed(cx->kdiff, cx->nkdiff, tgt);
     const u32 fpn = ((nfp ? nfp : 1u) + 1u);   /* vec4s in the b1 slot */
     if (cx->kdump && vsk && (cx->kdump_all || !cx->nkdiff || target)) {
         CapKdRec h;
         memset(&h, 0, sizeof h);
         memcpy(h.magic, "KDR1", 4);
-        h.op = op; h.rt_off = r->rt_off; h.fp_addr = r->fp_addr; h.fph = fph;
+        h.op = op; h.rt_off = tgt; h.fp_addr = r->fp_addr; h.fph = fph;
         h.fps_lo = (u32)fps; h.fps_hi = (u32)(fps >> 32);
         h.vs_idx = r->vs_idx; h.vsh = vsh; h.tk = tk; h.occ = occ; h.nfp = nfp;
         h.vertex_count = r->vertex_count; h.blend_key = r->blend_key;

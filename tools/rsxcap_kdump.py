@@ -200,7 +200,11 @@ def load_series(capdir, args, warn):
     caps.sort(key=lambda c: c.idx)
     assign_keys(caps, args.key)
 
-    # Brightness: the target the draws write most, unless --rt names one.
+    # Brightness: the target the draws write most that has images (a shadow
+    # map's depth-only pass can outnumber the scene's draws), unless --rt
+    # names one.
+    def image(rt):
+        return "backbuffer.bmp" if rt == 0 else "rt_%08X.bmp" % rt
     if args.rt is not None:
         rt = int(args.rt, 16)
     else:
@@ -208,8 +212,10 @@ def load_series(capdir, args, warn):
         for c in caps:
             for r in c.recs:
                 count[r.rt_off] = count.get(r.rt_off, 0) + 1
-        rt = max(count, key=count.get)
-    bmp = "backbuffer.bmp" if rt == 0 else "rt_%08X.bmp" % rt
+        ranked = sorted(count, key=lambda t: (-count[t], t))
+        have = [t for t in ranked if any(os.path.isfile(os.path.join(c.path, image(t))) for c in caps)]
+        rt = (have or ranked or [0])[0]
+    bmp = image(rt)
     for c in caps:
         m = bmp_mean(os.path.join(c.path, bmp))
         c.bright = None if m is None else sum(m) / 3.0
