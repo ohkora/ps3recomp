@@ -389,7 +389,7 @@ typedef struct {
     int                 image_id;
     uint32_t            r3[4];        /* captured race-free at dispatch time */
     int                 have_r3;
-    uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
+    uint32_t            taskset_ea;   /* the task this job runs as, named by the dispatch call */
     uint32_t            taskid;
 } spu_async_job;
 
@@ -627,7 +627,8 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
-        spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
+        spu_workload_dispatch_task(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i],
+                                   taskset_ea, start_t[i]);
     }
     s_ts_held = 0; ts_unlock();
 }
@@ -1482,8 +1483,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     return 0;
 }
 
-int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
-                                uint32_t args_ea)
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
 {
     if (!image || image_size == 0) return 0;
 
@@ -1524,12 +1525,13 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
-    /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
-     * set the globals for THIS task). Reading them later in the async thread races
-     * the next CreateTask overwriting the single-slot globals -- with two audio
-     * tasks that made both run task 1's descriptor. */
-    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+    /* The job runs as the task its caller names. Reading the task from the
+     * single-slot globals here instead raced every other writer of them: a
+     * CreateTask on another PPU thread, or a task exit starting the next task
+     * on an SPU thread, could set them between the caller's write and this
+     * read, and the job then ran another slot's task while its own slot stayed
+     * marked running with no thread behind it. */
+    j->taskset_ea = taskset_ea; j->taskid = taskid;
     /* Mark the task running NOW, not when its thread starts: in that gap another
      * task's exit saw it ready-but-not-running and started it a second time
      * (Twisted Metal's level-load inflate tasks each ran twice, concurrently). */
@@ -1607,4 +1609,14 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     pthread_detach(th);
 #endif
     return 1;
+}
+
+/* Callers that are not starting a SPURS task of their own still hand the job
+ * whatever task the globals name, as before. */
+int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                                uint32_t args_ea)
+{
+    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+    return spu_workload_dispatch_task(image, image_size, args_ea,
+                                      g_ydkj_real_taskset_ea, g_ydkj_real_taskid);
 }

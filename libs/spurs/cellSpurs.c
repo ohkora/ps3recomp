@@ -1081,7 +1081,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
               spu_taskset2_set_exit(taskset_ea, i, 0, 0); }   /* fresh entry for a recycled id */
             spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
                                    (uint64_t)context_ea, task_arg, task_lsp);
-            /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
+            /* Bridge to the image-22 dispatch so build_context uses this taskset+task.
+             * Another thread can overwrite these before the dispatch below runs,
+             * so the dispatch is handed the taskset and slot directly. */
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
@@ -1160,8 +1162,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 if (sz)
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
+                    spu_workload_dispatch_task(host_elf, (uint32_t)sz,
+                                               (uint32_t)(uintptr_t)context,
+                                               taskset_ea, i);
             }
             return CELL_OK;
         }

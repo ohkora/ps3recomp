@@ -1,8 +1,10 @@
 /* Manufactured policy modules exercise the real initializer, scheduler and
  * SPU policy execution. No game code, addresses or completion substitutions. */
 #define spu_workload_dispatch_async fixture_unbounded_dispatch
+#define spu_workload_dispatch_task fixture_unbounded_task_dispatch
 #include "../libs/spurs/cellSpurs.c"
 #undef spu_workload_dispatch_async
+#undef spu_workload_dispatch_task
 #include <assert.h>
 #include <stdatomic.h>
 #include "../runtime/spu/spu_coherency.h"
@@ -24,6 +26,8 @@ void sys_event_queue_uncancel_by_id(u32 id) {(void)id;}
 static atomic_uint unbounded_dispatches;
 int fixture_unbounded_dispatch(const uint8_t* pm,uint32_t size,uint32_t data)
 { (void)pm;(void)size;(void)data;atomic_fetch_add(&unbounded_dispatches,1);return 0; }
+int fixture_unbounded_task_dispatch(const uint8_t* pm,uint32_t size,uint32_t data,uint32_t ts,uint32_t task)
+{ (void)ts;(void)task;return fixture_unbounded_dispatch(pm,size,data); }
 static atomic_uint entered, produced, finished, release_consumer;
 static atomic_uint consumer_lane,producer_lane;
 static void finish(spu_context* c)

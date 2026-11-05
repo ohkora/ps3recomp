@@ -151,6 +151,15 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 
+/* spu_workload_dispatch_async for SPURS task `taskid` of the taskset at
+ * `taskset_ea`: the job builds that task's context and reports that task's
+ * exit. spu_workload_dispatch_async takes both from g_ydkj_real_taskset_ea and
+ * g_ydkj_real_taskid, which another thread creating or starting a task can
+ * overwrite before the dispatch reads them; a caller starting a known task
+ * passes it here instead. */
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 

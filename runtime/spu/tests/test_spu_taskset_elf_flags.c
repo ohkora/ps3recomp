@@ -14,16 +14,21 @@ uint8_t* vm_base;
 uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 static unsigned dispatches;
 static const uint8_t* dispatched_image;
-static uint32_t dispatched_size, dispatched_context;
+static uint32_t dispatched_size, dispatched_context, dispatched_taskset, dispatched_task;
+static uint32_t dispatched_tasks[4], dispatched_contexts[4];
 /* The scheduler updates the taskset's bitset line under the lock-line lock;
  * single-threaded here, so the lock and the coherency note are no-ops. */
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
-static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t context)
+static int spu_workload_dispatch_task(const uint8_t* image, uint32_t size, uint32_t context,
+                                      uint32_t taskset, uint32_t task)
 {
     dispatches++; dispatched_image = image; dispatched_size = size;
-    dispatched_context = context; return 1;
+    dispatched_context = context; dispatched_taskset = taskset; dispatched_task = task;
+    if (dispatches <= 4) { dispatched_tasks[dispatches - 1] = task;
+                           dispatched_contexts[dispatches - 1] = context; }
+    return 1;
 }
 /* Taskset2 exit-code slot: these tasksets are not registered as Taskset2,
  * where production returns without touching memory. */
@@ -41,6 +46,7 @@ static void setup(uint32_t flags, int pending)
     memset(vm_base, 0, 0x400000); memset(s_ts_run, 0, sizeof(s_ts_run));
     s_ts_lock = 0; dispatches = 0; dispatched_image = NULL;
     dispatched_size = dispatched_context = 0;
+    dispatched_taskset = dispatched_task = 0xFFFFFFFFu;
     g_ydkj_real_taskset_ea = g_ydkj_real_taskid = 0;
     uint8_t* image = vm_base + ELF;
     memcpy(image, "\177ELF", 4); image[4] = 1; image[5] = 2; image[6] = 1;
@@ -68,6 +74,8 @@ int main(void)
         CHECK(dispatched_image == vm_base + ELF, "dispatch uses ELF base, not tagged address");
         CHECK(dispatched_size == 100, "real parser receives synthetic ELF header");
         CHECK(dispatched_context == CONTEXT, "context argument is preserved");
+        CHECK(dispatched_taskset == TASKSET && dispatched_task == 0,
+              "requeued task is dispatched as its own taskset and slot");
         CHECK(g_ydkj_real_taskset_ea == TASKSET && g_ydkj_real_taskid == 0,
               "requeued task keeps its taskset and slot identity");
         CHECK(memcmp(before, vm_base + TASKSET + 0x80, sizeof(before)) == 0,
@@ -75,6 +83,17 @@ int main(void)
         CHECK((s_ts_run[0].running[0] & 0x80) != 0, "submitted task is marked in host run table");
         CHECK(vm_base[TASKSET + 0x20] == 0, "pending-ready bit consumed on submission");
     }
+    /* Two tasks started by one exit: each dispatch names its own slot. */
+    setup(1, 0);
+    vm_base[TASKSET + 0x10] = 0xC0; vm_base[TASKSET + 0x30] = 0xC0;
+    be32(vm_base + TASKSET + 0xB0 + 0x14, ELF); be32(vm_base + TASKSET + 0xB0 + 0x1C, CONTEXT + 0x100);
+    spu_taskset_task_exited(TASKSET, 127);
+    CHECK(dispatches == 2, "both ready tasks are dispatched");
+    CHECK(dispatched_tasks[0] == 0 && dispatched_contexts[0] == CONTEXT,
+          "first started task is dispatched as slot 0");
+    CHECK(dispatched_tasks[1] == 1 && dispatched_contexts[1] == CONTEXT + 0x100,
+          "second started task is dispatched as slot 1");
+    CHECK(dispatched_taskset == TASKSET, "started tasks keep their taskset");
     setup(1, 0); vm_base[TASKSET + 0x30] = 0;
     spu_taskset_task_exited(TASKSET, 127);
     CHECK(dispatches == 0, "disabled task is not dispatched");
