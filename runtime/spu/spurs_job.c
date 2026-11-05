@@ -401,7 +401,15 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * comment here claimed they carried the title's bus counts; they do not,
      * and feeding them into the completion event turned 0x40000000 into a 1 GB
      * allocation request. Kept because the printf service needs them. */
-    memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+    /* Keep the store readable. Jobs of one chain can end at the same time
+     * (SPURS_JC_WORKERS), so one copy at a time: a job that finds another
+     * copying leaves the store to it. */
+    { static int s_job_ls_busy;
+      if (!__atomic_exchange_n(&s_job_ls_busy, 1, __ATOMIC_ACQUIRE)) {
+          memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);
+          s_job_ls_valid = 1;
+          __atomic_store_n(&s_job_ls_busy, 0, __ATOMIC_RELEASE);
+      } }
     /* TEMP SPURS_JOB_LSWORD=<img>:<lsa>: after a job of that image, print the
      * LS word at lsa and every other LS offset holding the same value. */
     { static int img = -2; static uint32_t lsa; static int n = 0;
@@ -418,7 +426,6 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           }
           fprintf(stderr, "\n");
       } }
-    s_job_ls_valid = 1;
 
     g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
                           ? ctx.ch_out_mbox.value : 0;

@@ -2289,6 +2289,14 @@ enum {
     JCATTR_NAME       = 0x34,   /* be u32: char* EA (SetName) */
 };
 
+/* What a job's completion event carries about the job itself: its mailbox
+ * answer (0 when it posted none) and the command it ran. */
+typedef struct { u32 mbox, cmd; } jc_answer;
+/* Completions of jobs that finished while an earlier job of the same walk was
+ * still running (SPURS_JC_WORKERS), held until they can be sent in order. */
+#define JC_SIG_WINDOW 64
+typedef struct { int done; jc_answer a; } jc_done;
+
 /* Host-side jobchain registry (the CellSpursJobChain guest struct is opaque
  * to the game; we track what we need beside it). */
 #define MAX_JOBCHAINS 32
@@ -2297,8 +2305,15 @@ static struct {
     u32 entry_ea;     /* first command word EA */
     u16 size_desc;
     u16 max_grab;
+    u32 max_cont;     /* maxContention: how many SPUs may work the chain at once */
+    u32 nspus;        /* its SPURS instance's SPU count (0: instance not found) */
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
+    /* The walk's jobs when more than one may run at once (s_jcr_lock). */
+    int dispatched;          /* jobs started this walk                        */
+    int sig_next;            /* the next one whose completion is to be sent   */
+    int flushing;            /* a thread is sending completions               */
+    jc_done sig[JC_SIG_WINDOW];
     /* Where the chain stands between walks (see jc_thread). */
     u32 pc, ret_pc;          /* next command; CALL return address           */
     u64 halt_cmd;            /* the END/RET/ABORT word the last walk stopped on */
@@ -2361,15 +2376,18 @@ s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea)
 }
 
 /* Register (or re-register) a job chain handle. Shared by both Create forms. */
-static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
-                       const char* who)
+static s32 jc_register(u32 spurs_ea, u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
+                       u32 max_cont, const char* who)
 {
+    const struct SpursInst* si = spurs_inst_find(spurs_ea);
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
             s_jobchains[i].jc_ea     = jc_ea;
             s_jobchains[i].entry_ea  = entry_ea;
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
+            s_jobchains[i].max_cont  = max_cont ? max_cont : 1u;
+            s_jobchains[i].nspus     = si ? si->nspus : 0u;
             s_jobchains[i].run_count = 0;
             /* A new chain starts at its entry. The Simpsons Arcade Game creates
              * its chain again every frame, and each one must run from the top. */
@@ -2412,7 +2430,8 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
            name_ea ? (const char*)(vm_base + name_ea) : "-");
 
-    return jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
+    return jc_register((u32)spurs_ea, (u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
+                       vm_read32((u32)attr_ea + JCATTR_MAX_CONT),
                        "CreateJobChainWithAttribute");
 }
 
@@ -2435,7 +2454,7 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
                             u64 prio_ea, u32 maxContention,
                             u32 autoRequestSpuCount)
 {
-    (void)spurs_ea; (void)prio_ea;
+    (void)prio_ea;
     if (!jc_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     static int _n = 0;
@@ -2447,8 +2466,8 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
         if (entry_ea && (u32)entry_ea < 0x10000000u)
             jc_dump_commands("CreateJobChain", (u32)entry_ea, 16);
     }
-    return jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
-                       (u16)maxGrabbedJob, "CreateJobChain");
+    return jc_register((u32)spurs_ea, (u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
+                       (u16)maxGrabbedJob, maxContention, "CreateJobChain");
 }
 
 /* ---------------------------------------------------------------------------
@@ -2483,8 +2502,9 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
     u32 size_bin   = ((vm_read32(job_ea + JH_SIZE_BINARY) >> 16) & 0xFFFFu) << 4;
     u8  job_type   = *(vm_base + job_ea + JH_JOB_TYPE);
 
-    { static int _n = 0;
-      if (_n < 8) {
+    { static int _n = 0;   /* job runners may get here at once (SPURS_JC_WORKERS) */
+      if (__atomic_load_n(&_n, __ATOMIC_RELAXED) < 8 &&
+          __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8) {
           printf("[cellSpurs]   job[%d] @0x%08X eaBinary=0x%08X size=%u type=0x%02X hdr:",
                  idx, job_ea, ea_bin, size_bin, job_type);
           for (int o = 0; o < JH_SIZE; o += 4) {
@@ -2492,8 +2512,7 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
               printf(" %08X", vm_read32(job_ea + o));
           }
           printf("\n");
-      }
-      _n++; }
+      } }
 
     if (!ea_bin || !size_bin || ea_bin >= 0x10000000u) {
         static int _b = 0;
@@ -2683,7 +2702,16 @@ static u64 spurs_event_data3_probe(void)
     return (u64)(unsigned)v;
 }
 
-static void jc_signal_done(u32 jc_ea, int job_index)
+/* Take the finished job's answer from this thread's job state: spurs_job.c
+ * leaves it there for the thread that ran the job. */
+static jc_answer jc_take_answer(void)
+{
+    jc_answer a = { g_spurs_job_mbox_valid ? g_spurs_job_mbox : 0u, g_spurs_job_cmd };
+    g_spurs_job_mbox_valid = 0;
+    return a;
+}
+
+static void jc_signal_answer(u32 jc_ea, int job_index, jc_answer a)
 {
     /* Carry the job's mailbox answer in the completion event. On hardware the
      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
@@ -2698,7 +2726,6 @@ static void jc_signal_done(u32 jc_ea, int job_index)
      * held, which blocks the main thread's teardown behind it. A chain-level
      * signal (job_index < 0) sends 0. */
     u64 d2 = (u64)(unsigned)(job_index < 0 ? 0 : job_index);
-    u64 mbox = 0, d3 = 0;
     (void)spurs_event_data3_probe();   /* prime d3_probe_valid */
     /* A PPU-side query submits a job and reads the reply out of the completion
      * event's data3 (the guest stores r7 at sp+0xB8 and reads the value back
@@ -2716,19 +2743,13 @@ static void jc_signal_done(u32 jc_ea, int job_index)
      * mailbox never goes in data2, which is the job index above: a mailbox
      * value there would end the consumer's wait early. */
     enum { SGX_Q_IN_BUSES = 0x105, SGX_Q_OUT_BUSES = 0x106 };
-    const int answers_a_count = (g_spurs_job_cmd == SGX_Q_IN_BUSES ||
-                                 g_spurs_job_cmd == SGX_Q_OUT_BUSES);
-    if (g_spurs_job_mbox_valid) {
-        mbox = g_spurs_job_mbox;
-        d3 = g_spurs_job_mbox_intr; (void)d3;
-        g_spurs_job_mbox_valid = 0;
-    }
+    const int answers_a_count = (a.cmd == SGX_Q_IN_BUSES || a.cmd == SGX_Q_OUT_BUSES);
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
                                             SPURS_EVENT_PORT, jc_ea, d2,
                                             d3_probe_valid
                                                 ? spurs_event_data3_probe()
-                                                : (answers_a_count ? mbox : 0));
+                                                : (answers_a_count ? (u64)a.mbox : 0));
         static int n = 0;
         if (PS3_LOG_FIRST(n, 8))
             printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
@@ -2736,6 +2757,11 @@ static void jc_signal_done(u32 jc_ea, int job_index)
                    jc_ea, job_index, s_spurs_event_queue[i],
                    (unsigned long long)d2, rc);
     }
+}
+
+static void jc_signal_done(u32 jc_ea, int job_index)
+{
+    jc_signal_answer(jc_ea, job_index, jc_take_answer());
 }
 
 /* Where a walk stopped. halted: on an END/RET/ABORT word (cmd), which the next
@@ -2746,6 +2772,188 @@ static void jc_stop(int slot, u32 pc, u32 ret_pc, int halted, u64 cmd)
     s_jobchains[slot].ret_pc   = ret_pc;
     s_jobchains[slot].halted   = halted;
     s_jobchains[slot].halt_cmd = cmd;
+}
+
+/* ---------------------------------------------------------------------------
+ * Job runners: a chain's jobs on more than one host thread (SPURS_JC_WORKERS)
+ *
+ * On hardware a job chain is worked by up to maxContention SPUs at once. Each
+ * takes the next job from the command stream, and only SYNC and LWSYNC make
+ * the jobs after them wait until every job before them has finished. The
+ * walker here ran each job itself, to the end, before it read the next
+ * command, so a chain's jobs never overlapped. PlayStation All-Stars Battle
+ * Royale (BCUS98472) draws through a chain created with maxContention 3; once
+ * its first tutorial lesson starts, that chain's jobs take about 66 ms a
+ * frame, all on the walker's one thread, and the game runs at 17-18 fps.
+ *
+ * SPURS_JC_WORKERS=<n> lets up to n jobs of a chain run at once, capped by
+ * the chain's maxContention, by its SPURS instance's SPU count and by 6, the
+ * most SPUs an instance can have. The walker hands each job to an idle runner
+ * thread, or runs it itself when none is idle. Before a command that orders
+ * jobs it waits until every job it started has finished and its completion
+ * has been sent:
+ *   - SYNC and LWSYNC (op 2), whose whole point is that wait;
+ *   - GUARD, so the jobs before a guard are done before the walker waits on it;
+ *   - END, RET, ABORT, and any other way a walk stops, so a chain whose walker
+ *     has stopped has no job running (Join, the next Run).
+ *
+ * Completion events still go out one per job, in job order, each carrying its
+ * own job's index and mailbox answer. A title may count on that order: Gran
+ * Turismo 5 Prologue's audio service stops receiving once data2 is the last
+ * job it queued. A job that ends before an earlier one leaves its completion
+ * to be sent after that one's (up to JC_SIG_WINDOW jobs ahead; the walker
+ * waits beyond that).
+ *
+ * Each runner claims its own SPU number (spurs_job_set_spu_num): titles key
+ * per-SPU resources on it, and two jobs running at once as SPU 0 would share
+ * them. The walker's own jobs are SPU 0, runner k is SPU k.
+ *
+ * Unset, or 1, keeps the old behaviour: the walker runs every job itself and
+ * sends its completion straight after it.
+ * -----------------------------------------------------------------------*/
+#define JC_MAX_RUNNERS 6
+extern void spurs_job_set_spu_num(uint32_t n);
+
+typedef struct {
+    int slot, idx;
+    u32 jc_ea, job_ea, size_desc;
+} jc_job;
+
+static SRWLOCK            s_jcr_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_jcr_work = CONDITION_VARIABLE_INIT; /* a runner was handed a job */
+static CONDITION_VARIABLE s_jcr_done = CONDITION_VARIABLE_INIT; /* a runner or a completion freed up */
+static struct {
+    int started;
+    int busy;          /* from hand-over until its job has ended */
+    jc_job job;
+} s_jcr[JC_MAX_RUNNERS];   /* [0] unused: SPU 0 is the walker */
+
+static int jc_workers(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char* e = getenv("SPURS_JC_WORKERS");
+        int v = e ? atoi(e) : 1;
+        if (v < 1) v = 1;
+        if (v > JC_MAX_RUNNERS) v = JC_MAX_RUNNERS;
+        if (v > 1) printf("[cellSpurs] SPURS_JC_WORKERS=%d: a chain runs up to that many jobs at "
+                          "once, capped by its maxContention and its instance's SPUs\n", v);
+        n = v;
+    }
+    return n;
+}
+
+/* A job of a walk has ended: record its completion, then send every one that
+ * is now due, in job order. One thread sends at a time; a job that ends while
+ * another thread is sending leaves its completion to that thread, which looks
+ * again after each send. */
+static void jc_complete(const jc_job* j, jc_answer a)
+{
+    const int slot = j->slot;
+    AcquireSRWLockExclusive(&s_jcr_lock);
+    s_jobchains[slot].sig[j->idx % JC_SIG_WINDOW].a = a;
+    s_jobchains[slot].sig[j->idx % JC_SIG_WINDOW].done = 1;
+    if (!s_jobchains[slot].flushing) {
+        s_jobchains[slot].flushing = 1;
+        for (;;) {
+            jc_done* d = &s_jobchains[slot].sig[s_jobchains[slot].sig_next % JC_SIG_WINDOW];
+            if (!d->done) break;
+            const jc_answer da = d->a;
+            const int idx = s_jobchains[slot].sig_next++;
+            d->done = 0;
+            ReleaseSRWLockExclusive(&s_jcr_lock);
+            /* Signal per JOB, not per lap. The application waits once for each
+             * unit of work it queued -- one title notified the guard 7 times
+             * and sat in event_queue_receive 30 times -- so batching the
+             * completion into one event per pass leaves it waiting for
+             * completions that, from its point of view, never arrive. */
+            jc_signal_answer(j->jc_ea, idx, da);
+            AcquireSRWLockExclusive(&s_jcr_lock);
+        }
+        s_jobchains[slot].flushing = 0;
+        WakeAllConditionVariable(&s_jcr_done);
+    }
+    ReleaseSRWLockExclusive(&s_jcr_lock);
+}
+
+static DWORD WINAPI jc_runner_thread(LPVOID p)
+{
+    const int k = (int)(intptr_t)p;
+    ps3_thread_name("spurs job %d", k);
+#ifdef _WIN32
+    /* Headroom for the stack-overflow reporter, as the SPU task threads keep. */
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#endif
+    spurs_job_set_spu_num((u32)k);
+    AcquireSRWLockExclusive(&s_jcr_lock);
+    for (;;) {
+        while (!s_jcr[k].busy)
+            SleepConditionVariableSRW(&s_jcr_work, &s_jcr_lock, INFINITE, 0);
+        const jc_job j = s_jcr[k].job;
+        ReleaseSRWLockExclusive(&s_jcr_lock);
+        jc_run_one_job(j.job_ea, j.idx, j.size_desc);
+        const jc_answer a = jc_take_answer();
+        AcquireSRWLockExclusive(&s_jcr_lock);
+        s_jcr[k].busy = 0;                     /* free for the walker's next job */
+        WakeAllConditionVariable(&s_jcr_done);
+        ReleaseSRWLockExclusive(&s_jcr_lock);
+        jc_complete(&j, a);
+        AcquireSRWLockExclusive(&s_jcr_lock);
+    }
+    return 0;
+}
+
+/* Run one job of a walk: hand it to an idle runner, else run it here. Runners
+ * are shared by every chain; a chain uses runners 1..cap-1 only. */
+static void jc_dispatch(const jc_job* j, int cap)
+{
+    if (cap <= 1) {                            /* one at a time, as before */
+        jc_run_one_job(j->job_ea, j->idx, j->size_desc);
+        /* Signal per JOB, not per lap (see jc_complete). */
+        jc_signal_done(j->jc_ea, j->idx);
+        return;
+    }
+    const int slot = j->slot;
+    AcquireSRWLockExclusive(&s_jcr_lock);
+    /* Completions held for an earlier job that is still running: bounded. */
+    while (j->idx - s_jobchains[slot].sig_next >= JC_SIG_WINDOW)
+        SleepConditionVariableSRW(&s_jcr_done, &s_jcr_lock, INFINITE, 0);
+    s_jobchains[slot].dispatched = j->idx + 1;
+    for (int k = 1; k < cap; k++) {
+        if (!s_jcr[k].started) {
+            /* Reserved, not committed: lifted SPU code can nest deeply, which
+             * is why the SPU task threads reserve the same. */
+#ifdef _WIN32
+            HANDLE th = CreateThread(NULL, 256u << 20, jc_runner_thread, (LPVOID)(intptr_t)k,
+                                     STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+#else
+            HANDLE th = CreateThread(NULL, 256u << 20, jc_runner_thread, (LPVOID)(intptr_t)k,
+                                     0, NULL);
+#endif
+            if (!th) continue;
+            CloseHandle(th);
+            s_jcr[k].started = 1;
+        }
+        if (s_jcr[k].busy) continue;
+        s_jcr[k].job = *j;
+        s_jcr[k].busy = 1;
+        WakeAllConditionVariable(&s_jcr_work);
+        ReleaseSRWLockExclusive(&s_jcr_lock);
+        return;
+    }
+    ReleaseSRWLockExclusive(&s_jcr_lock);
+    jc_run_one_job(j->job_ea, j->idx, j->size_desc);   /* no runner idle */
+    jc_complete(j, jc_take_answer());
+}
+
+/* Wait until every job this walk started has ended and its completion has
+ * been sent. */
+static void jc_drain(int slot)
+{
+    AcquireSRWLockExclusive(&s_jcr_lock);
+    while (s_jobchains[slot].sig_next < s_jobchains[slot].dispatched || s_jobchains[slot].flushing)
+        SleepConditionVariableSRW(&s_jcr_done, &s_jcr_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&s_jcr_lock);
 }
 
 /* Walk a chain's command stream from where it stands, and leave it on the
@@ -2766,6 +2974,14 @@ static void jc_execute(int slot)
     u32 pc = s_jobchains[slot].pc, ret_pc = s_jobchains[slot].ret_pc;
     u32 idle_pc = pc;    /* the first command since the last job */
     int jobs = 0;
+    /* Jobs that may run at once: SPURS_JC_WORKERS, capped by maxContention and
+     * by the instance's SPU count (runner k is SPU k, which must exist). */
+    int cap = jc_workers();
+    if ((u32)cap > s_jobchains[slot].max_cont) cap = (int)s_jobchains[slot].max_cont;
+    if (s_jobchains[slot].nspus && (u32)cap > s_jobchains[slot].nspus) cap = (int)s_jobchains[slot].nspus;
+    AcquireSRWLockExclusive(&s_jcr_lock);       /* the last walk drained them all */
+    s_jobchains[slot].dispatched = s_jobchains[slot].sig_next = 0;
+    ReleaseSRWLockExclusive(&s_jcr_lock);
     /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
      * SERVICE LOOP -- guard, job, sync, next, repeat -- and is meant to run for
      * the lifetime of the subsystem. A flat cap on total commands therefore
@@ -2782,22 +2998,21 @@ static void jc_execute(int slot)
 
         if (cmd != 0 && op == 0) {                    /* JOB */
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
-            int idx = jobs++;
-            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
+            const jc_job j = { slot, jobs++, jc_ea, (u32)(cmd & ~7ull), size_desc };
+            jc_dispatch(&j, cap);        /* runs it, and signals its completion */
             idle = 0;                    /* real work: the chain is healthy */
-            /* Signal per JOB, not per lap. The application waits once for each
-             * unit of work it queued -- this title notified the guard 7 times
-             * and sat in event_queue_receive 30 times -- so batching the
-             * completion into one event per pass leaves it waiting for
-             * completions that, from its point of view, never arrive. */
-            jc_signal_done(jc_ea, idx);
             pc += 8; idle_pc = pc; continue;
+        }
+        if (op == 2) {                   /* SYNC / LWSYNC: jobs before it finish first */
+            jc_drain(slot);
+            pc += 8; continue;
         }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
         if (op == 3) { pc = (u32)(cmd & ~7ull); continue; }   /* NEXT     */
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
+                jc_drain(slot);
                 /* One a walk, so every frame for an appending title: the first
                  * few, then one in 4096. */
                 { static unsigned n_end = 0;
@@ -2809,10 +3024,11 @@ static void jc_execute(int slot)
                 return;
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
-                if (!ret_pc) { jc_stop(slot, pc, 0, 1, cmd); return; }
+                if (!ret_pc) { jc_drain(slot); jc_stop(slot, pc, 0, 1, cmd); return; }
                 pc = ret_pc; ret_pc = 0; continue;
             }
             if (ext == (7 | (0 << 3))) {                      /* ABORT */
+                jc_drain(slot);
                 printf("[cellSpurs] chain 0x%08X: ABORT\n", jc_ea);
                 jc_stop(slot, pc, ret_pc, 1, cmd);
                 return;
@@ -2820,16 +3036,17 @@ static void jc_execute(int slot)
         }
         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
             u32 g_ea = (u32)(cmd & ~127ull);
+            jc_drain(slot);
             if (!jg_wait(g_ea)) {                        /* still closed */
                 jc_stop(slot, pc, ret_pc, 0, 0);         /* wait here again */
                 return;
             }
             pc += 8; continue;
         }
-        /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
-         * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
+        /* NOP(0) / FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
         pc += 8;
     }
+    jc_drain(slot);
     jc_stop(slot, idle_pc, ret_pc, 0, 0);
     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
            "job(s) -- malformed?\n",
