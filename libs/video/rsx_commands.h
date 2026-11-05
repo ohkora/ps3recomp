@@ -186,6 +186,11 @@ extern "C" {
 #define NV4097_SET_DEPTH_TEST_ENABLE            0x00000A74
 #define NV4097_SET_DEPTH_FUNC                   0x00000A6C
 #define NV4097_SET_DEPTH_MASK                   0x00000A70
+#define NV4097_SET_POLY_OFFSET_POINT_ENABLE     0x00000A60
+#define NV4097_SET_POLY_OFFSET_LINE_ENABLE      0x00000A64
+#define NV4097_SET_POLY_OFFSET_FILL_ENABLE      0x00000A68
+#define NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR  0x00000A78
+#define NV4097_SET_POLYGON_OFFSET_BIAS          0x00000A7C
 #define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
 #define NV4097_SET_STENCIL_FUNC                 0x00000330
 #define NV4097_SET_STENCIL_FUNC_REF             0x00000334
@@ -304,6 +309,12 @@ typedef struct rsx_state {
     u32 cull_face;
     u32 front_face;
 
+    /* Polygon offset (glPolygonOffset terms): enabled per what a primitive
+     * rasterises as (bit 0 points, bit 1 lines, bit 2 fill), the factor that
+     * multiplies its depth slope, and the bias in steps of the depth buffer. */
+    u32 poly_offset_enable;
+    float poly_offset_scale, poly_offset_bias;
+
     /* Color mask — bits: [0] B, [8] G, [16] R, [24] A */
     u32 color_mask;
     int color_mask_dirty;
@@ -409,6 +420,14 @@ void rsx_state_init(rsx_state* state);
  * data:   32-bit value to write
  * Returns 0 on success, -1 if method is unrecognized. */
 int rsx_process_method(rsx_state* state, u32 method, u32 data);
+
+/* The polygon offset a draw of BEGIN_END primitive `prim` gets, for a 24-bit
+ * depth buffer: *slope multiplies the primitive's largest depth slope and
+ * *units counts steps of 2^-24. The guest's bias counts steps of its own
+ * surface's depth (SET_SURFACE_FORMAT), so a Z16 step is 256 of those.
+ * Returns 0, with both 0, when the offset is off for that primitive (or set
+ * to nothing, or not a number). */
+int rsx_poly_offset_z24(const rsx_state* state, u32 prim, float* slope, float* units);
 
 /* An incrementing run of data words read big-endian from `src`, for methods
  * `method`, `method` + 4, ... Handles vertex-program microcode and constant

@@ -758,6 +758,28 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    /* Polygon offset. Before these were kept, a title's shadow pass drew its
+     * depth without the offset it pushes it back by, and every lit surface
+     * compared against its own depth in the shadow map. */
+    if (method >= NV4097_SET_POLY_OFFSET_POINT_ENABLE &&
+        method <= NV4097_SET_POLY_OFFSET_FILL_ENABLE) {
+        const u32 bit = 1u << ((method - NV4097_SET_POLY_OFFSET_POINT_ENABLE) / 4u);
+        state->poly_offset_enable = (data & 1u) ? (state->poly_offset_enable | bit)
+                                                : (state->poly_offset_enable & ~bit);
+        state->depth_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR) {
+        memcpy(&state->poly_offset_scale, &data, sizeof data);
+        state->depth_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_POLYGON_OFFSET_BIAS) {
+        memcpy(&state->poly_offset_bias, &data, sizeof data);
+        state->depth_dirty = 1;
+        return 0;
+    }
+
     /* Culling */
     if (method == NV4097_SET_CULL_FACE_ENABLE) {
         state->cull_face_enable = data ? 1 : 0;
@@ -1021,4 +1043,23 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
     }
 
     return methods_processed;
+}
+
+int rsx_poly_offset_z24(const rsx_state* state, u32 prim, float* slope, float* units)
+{
+    *slope = 0.0f;
+    *units = 0.0f;
+    if (!state) return 0;
+    /* BEGIN_END: 1 points, 2 lines, 3 line loop, 4 line strip, 5.. polygons. */
+    const u32 bit = prim == 1u ? 1u : (prim >= 2u && prim <= 4u) ? 2u : 4u;
+    if (!(state->poly_offset_enable & bit)) return 0;
+    float f = state->poly_offset_scale, b = state->poly_offset_bias;
+    if (f != f) f = 0.0f;
+    if (b != b) b = 0.0f;
+    /* SET_SURFACE_FORMAT [7:5]: 1 Z16, 2 Z24S8. */
+    if (((state->surface_format >> 5) & 7u) == 1u) b *= 256.0f;
+    if (f == 0.0f && b == 0.0f) return 0;
+    *slope = f;
+    *units = b;
+    return 1;
 }
