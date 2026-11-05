@@ -222,6 +222,8 @@ typedef struct {
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     u32 pitch;          /* guest row pitch it was read with (0 = tightly packed) */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
+    u32 fullh;          /* every source byte at that upload (cap_hash), while
+                         * RSX_CAP is set; 0 otherwise */
     int cube;           /* resource is a 6-face cube, sampled as TextureCube */
     u32 key;            /* the ORIGINAL bound offset -- the cache lookup key.
                          * off is the RESOLVED source after TEX_OFF_BIAS/TEX_REMAP
@@ -1602,6 +1604,7 @@ static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
     *(u16*)(hdr+26) = 1; *(u16*)(hdr+28) = 24; *(u32*)(hdr+34) = datasz;
     fwrite(hdr, 1, 54, f);
     u8* line = (u8*)malloc(rowb);
+    double sum[3] = {0, 0, 0};   /* the mean colour, for a time series in the log */
     if (line) for (int y = (int)h - 1; y >= 0; y--) {   /* BMP is bottom-up */
         const u8* srow = (const u8*)mapped + (u64)y * pitch;
         memset(line, 0, rowb);
@@ -1629,11 +1632,14 @@ static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
             line[x*3+0] = (u8)(ab*255.0f);
             line[x*3+1] = (u8)(ag*255.0f);
             line[x*3+2] = (u8)(ar*255.0f);
+            sum[0] += line[x*3+2]; sum[1] += line[x*3+1]; sum[2] += line[x*3+0];
         }
         fwrite(line, 1, rowb, f);
     }
     free(line);
     fclose(f);
+    printf("[RSXCAP] %s mean %.2f %.2f %.2f\n", path,
+           sum[0] / ((double)w * h), sum[1] / ((double)w * h), sum[2] / ((double)w * h));
 }
 
 /* Copy one GPU resource into a fresh readback buffer and write it as a BMP.
@@ -1716,6 +1722,18 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
     rb->lpVtbl->Release(rb);
 }
 
+/* Is off in the RSX_CAP_ONLY list? An empty list takes everything. */
+static int cap_listed(const u32* only, int n, u32 off)
+{
+    if (!n) return 1;
+    for (int i = 0; i < n; i++) if (only[i] == off) return 1;
+    return 0;
+}
+
+/* A draw's content signatures for the capture manifest (defined with the VP
+ * vertex layout, below). */
+static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 kdiff_rt, int* kdiff_n);
+
 static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
 {
     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
@@ -1736,6 +1754,10 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 fprintf(mf, "offrt[%d] off=0x%08X %ux%u dxgi=%u\n", i, s_d3d.off_rt[i].off,
                         s_d3d.off_rt[i].w, s_d3d.off_rt[i].h, s_d3d.off_rt[i].dxgi);
         fprintf(mf, "--- ops ---\n");
+        /* RSX_CAP_KDIFF=<hex colour target>: see cap_draw_signature. */
+        const char* kd = getenv("RSX_CAP_KDIFF");
+        const u32 kdiff_rt = kd ? (u32)strtoul(kd, NULL, 16) : 0;
+        int kdiff_n = 0;
         for (u32 d = 0; d < ndraws && d < MAX_DRAWS; d++) {
             const D3D12DrawRecord* r = &s_d3d.draws[d];
             if (r->is_clear)
@@ -1756,6 +1778,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                                 (r->tex[u].fmt & 0x20) ? "LN" : "SZ",
                                 (r->tex[u].fmt & 0x40) ? ",NR" : "",
                                 r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF);
+                cap_draw_signature(mf, r, kdiff_rt, &kdiff_n);
             }
         }
         /* Per-draw VP constant banks for the first few offscreen-RT geometry
@@ -1794,13 +1817,25 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         fclose(mf);
     }
 
-    /* Backbuffer (in PRESENT state at capture time) + every used offscreen RT. */
-    snprintf(path, sizeof path, "%s/backbuffer.bmp", dir);
-    cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
-                       DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
+    /* Backbuffer (in PRESENT state at capture time) + every used offscreen RT.
+     * RSX_CAP_ONLY=<hex>[,<hex>...] writes only the RTs at those offsets, and
+     * the backbuffer only if 0 is listed: a long series of captures of one
+     * target then costs one image each. */
+    u32 only[8]; int nonly = 0;
+    { const char* e = getenv("RSX_CAP_ONLY");
+      while (e && *e && nonly < 8) {
+          char* end; only[nonly++] = (u32)strtoul(e, &end, 16);
+          if (end == e) { nonly--; break; }
+          e = (*end == ',') ? end + 1 : NULL;
+      } }
+    if (cap_listed(only, nonly, 0)) {
+        snprintf(path, sizeof path, "%s/backbuffer.bmp", dir);
+        cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
+                           DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
+    }
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
-        if (!r->res || !r->used) continue;
+        if (!r->res || !r->used || !cap_listed(only, nonly, r->off)) continue;
         snprintf(path, sizeof path, "%s/rt_%08X.bmp", dir, r->off);
         cap_readback_write(r->res, r->w, r->h, r->dxgi, r->st, fi, path);
     }
@@ -2982,6 +3017,22 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
  * than a statement-expression macro so the file still compiles under MSVC;
  * ps3recomp builds with clang-cl, but titles like Tokyo Jungle drive the build
  * through the Visual Studio generator. */
+/* FNV-1a over every byte, for the frame capture's content signatures
+ * (cap_draw_signature). tex_csum below samples about a thousand words. */
+static u32 cap_hash(const void* p, size_t n)
+{
+    const u8* b = (const u8*)p;
+    u32 h = 2166136261u;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+    return h;
+}
+static int cap_content_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RSX_CAP") ? 1 : 0;
+    return on;
+}
+
 static u32 tex_csum(const u8* base, u32 nbytes)
 {
     u32 h = 2166136261u;
@@ -3618,7 +3669,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->pitch = row_pitch; t->cube = cube; t->used = 1;
     { u32 nb = tl.face_bytes;
-      t->csum = TEX_CSUM(vm_base + off, nb); }
+      t->csum = TEX_CSUM(vm_base + off, nb);
+      t->fullh = cap_content_on() ? cap_hash(vm_base + off, nb) : 0; }
     #undef TEX_CSUM
     return slot;
 }
@@ -6454,6 +6506,128 @@ static u32 upload_quads_from_rsx(u32 first, u32 count)
  * by its RSX type; disabled slots read (0,0,0,1). */
 typedef struct { float v[4]; } VPSlot;
 #define VP_VERT_STRIDE (16 * sizeof(VPSlot))   /* 256 */
+
+/* ---------------------------------------------------------------------------
+ * Capture content signatures (RSX_CAP)
+ *
+ * Two frames with the same ops and the same states can still draw different
+ * pictures: the constants, the vertex data and the texture bytes are not in
+ * the op lines. Each VP draw of a capture gets a "sig" line with hashes of the
+ * copies the replay itself drew from, taken when the draw was recorded:
+ *   kvs  the vertex constant bank (its vp_cb slot)
+ *   kfp  the fragment constants and alpha reference (its b1 slot) / count
+ *   vb   the vertex data (vp_vb) / vertices
+ * (Not the indices: the frame end clears each record's indexed flag before
+ * the capture runs.)
+ * and a "tsig" line per draw with each set unit's source:
+ *   t<u>=<hash>   FNV-1a of the guest bytes the upload reads, as they are now,
+ *                 marked when they are no longer what the cached upload holds:
+ *                 "!s" the cache's sparse checksum sees the change, so the
+ *                 next bind uploads again; "!m" it misses it, so the draws
+ *                 keep sampling the older contents; "?" no cached upload found
+ *   t<u>=rt / ds  the unit samples an offscreen colour / depth surface
+ *
+ * RSX_CAP_KDIFF=<hex colour target>: for the first CAP_KDIFF_OPS draws into
+ * that target, "dvs"/"dfp" lines list the vertex / fragment constants that
+ * differ from the same draw (same position among them, same program) of the
+ * previous capture, up to 12 of each.
+ * -----------------------------------------------------------------------*/
+#define CAP_KDIFF_OPS 64
+static struct cap_kd {
+    u32 fp_addr, nfp;
+    int have;
+    float vs[RSX_MAX_VERTEX_CONSTANTS * 4];
+    float fp[(VP_FP_MAX_CONSTS + 1) * 4];
+} *s_cap_kd;
+
+/* The program's inline-constant count, which vp_record_cb wrote ahead of the
+ * alpha reference. Patching changes the values, never the count. */
+static u32 cap_fp_nconsts(u32 fp_addr)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int, u32);
+    static rsx_fp_constant_block k;   /* 32 KB: not on the stack */
+    if (!fp_addr || !vm_base) return 0;
+    const u32 foff = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
+    if (foff == 0xFFFFFFFFu) return 0;
+    const int nc = rsx_fp_collect_constants(vm_base + foff, VP_FP_MAX_BYTES, &k);
+    return (nc > 0 && nc <= VP_FP_MAX_CONSTS) ? (u32)nc : 0;
+}
+
+static void cap_kdiff(FILE* mf, const char* tag, const char* name, const float* now,
+                      const float* was, u32 n)
+{
+    int shown = 0;
+    for (u32 i = 0; i < n && shown < 12; i++) {
+        const float* a = now + i * 4; const float* b = was + i * 4;
+        if (!memcmp(a, b, 16)) continue;
+        fprintf(mf, "      %s %s[%3u] = %g %g %g %g (was %g %g %g %g)\n", tag, name, i,
+                a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+        shown++;
+    }
+}
+
+static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 kdiff_rt, int* kdiff_n)
+{
+    extern uint8_t* vm_base;
+    if (!r->is_vp) return;
+    /* The capture runs after the frame's parity flip: its copies are in the
+     * other half. */
+    const u32 par = (u32)(s_d3d.vp_parity ^ 1);
+    const float* vsk = NULL; const float* fpk = NULL;
+    u32 kvs = 0, kfp = 0, vb = 0;
+    const u32 nfp = cap_fp_nconsts(r->fp_addr);
+    if (s_d3d.vp_cb_mapped && r->cb_slot < MAX_DRAWS) {
+        vsk = (const float*)((const char*)s_d3d.vp_cb_mapped
+              + ((u64)par * MAX_DRAWS + r->cb_slot) * VP_CB_STRIDE);
+        kvs = cap_hash(vsk, RSX_MAX_VERTEX_CONSTANTS * 16);
+    }
+    if (s_d3d.vp_fpcb_mapped && r->cb_slot < MAX_DRAWS) {
+        fpk = (const float*)((const char*)s_d3d.vp_fpcb_mapped
+              + ((u64)par * MAX_DRAWS + r->cb_slot) * VP_FPCB_STRIDE);
+        kfp = cap_hash(fpk, ((nfp ? nfp : 1u) + 1u) * 16u);
+    }
+    if (s_d3d.vp_vb_mapped && r->vertex_count &&
+        (u64)r->vb_byte_offset + (u64)r->vertex_count * VP_VERT_STRIDE <= (u64)MAX_VERTICES * VP_VERT_STRIDE)
+        vb = cap_hash((const u8*)s_d3d.vp_vb_mapped + (u64)par * MAX_VERTICES * VP_VERT_STRIDE
+                      + r->vb_byte_offset, (size_t)r->vertex_count * VP_VERT_STRIDE);
+    fprintf(mf, "      sig kvs=%08X kfp=%08X/%u vb=%08X/%u\n", kvs, kfp, nfp, vb, r->vertex_count);
+
+    fprintf(mf, "      tsig");
+    for (int u = 0; u < VP_TEX_UNITS; u++) {
+        if (!r->tex[u].set) continue;
+        if (r->tex_dz[u] >= 0) { fprintf(mf, " t%d=ds", u); continue; }
+        if (r->tex_rt[u] >= 0) { fprintf(mf, " t%d=rt", u); continue; }
+        if (!r->tex[u].off || !vm_base) { fprintf(mf, " t%d=-", u); continue; }
+        rsx_tex_layout tl;
+        rsx_texture_layout_pitched(r->tex[u].fmt, r->tex[u].w, r->tex[u].h, r->tex[u].pitch, &tl);
+        const VPTexSlot* c = NULL;
+        for (int i = 0; i < VP_TEX_SLOTS && !c; i++) {
+            const VPTexSlot* t = &s_d3d.vp_tex[i];
+            if (t->res && t->key == r->tex[u].off && t->w == r->tex[u].w && t->h == r->tex[u].h &&
+                t->fmt == r->tex[u].fmt && t->pitch == r->tex[u].pitch) c = t;
+        }
+        const u32 src = c ? c->off : r->tex[u].off;   /* the bytes the upload read */
+        const u32 h = cap_hash(vm_base + src, tl.face_bytes);
+        const char* mark = !c ? "?" : (!c->fullh || c->fullh == h) ? ""
+                         : (tex_csum(vm_base + src, tl.face_bytes) != c->csum) ? "!s" : "!m";
+        fprintf(mf, " t%d=%08X%s", u, h, mark);
+    }
+    fprintf(mf, "\n");
+
+    if (!kdiff_rt || r->rt_off != kdiff_rt || *kdiff_n >= CAP_KDIFF_OPS || !vsk) return;
+    if (!s_cap_kd && !(s_cap_kd = (struct cap_kd*)calloc(CAP_KDIFF_OPS, sizeof *s_cap_kd))) return;
+    struct cap_kd* k = &s_cap_kd[(*kdiff_n)++];
+    if (k->have && k->fp_addr == r->fp_addr) {
+        cap_kdiff(mf, "dvs", "c", vsk, k->vs, RSX_MAX_VERTEX_CONSTANTS);
+        if (fpk && k->nfp == nfp) cap_kdiff(mf, "dfp", "k", fpk, k->fp, (nfp ? nfp : 1u) + 1u);
+    } else if (k->have) {
+        fprintf(mf, "      dvs (previous capture drew program 0x%08X here)\n", k->fp_addr);
+    }
+    memcpy(k->vs, vsk, sizeof k->vs);
+    if (fpk) memcpy(k->fp, fpk, ((nfp ? nfp : 1u) + 1u) * 16u);
+    k->fp_addr = r->fp_addr; k->nfp = nfp; k->have = 1;
+}
 
 
 void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
