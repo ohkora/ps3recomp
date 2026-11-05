@@ -593,6 +593,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
 
+    /* GCM_HOLE_TRACE (spurs_job.c): which image polled or updated which line. */
+    { extern void (*g_spu_atomic_note_hook)(spu_context*, uint32_t, uint32_t);
+      if (g_spu_atomic_note_hook) g_spu_atomic_note_hook(ctx, cmd, ea); }
+
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;
         if ((++s_n % 2000000) == 0 || ea != s_lastea) {

@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-hole-trace-') as tmp:
     off = subprocess.run([str(binary), 'off'], capture_output=True, text=True,
                          timeout=60, cwd=tmp, env=base)
     assert off.returncode == 0, off.stderr[-2000:]
-    assert 'off: dma hook null, report hook null' in off.stdout, off.stdout
+    assert 'off: dma hook null, report hook null, atomic hook null' in off.stdout, off.stdout
     assert '[hole' not in off.stderr, off.stderr[-2000:]
 
     on = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60,
@@ -65,6 +65,17 @@ with tempfile.TemporaryDirectory(prefix='spurs-hole-trace-') as tmp:
         r'its put ea=0x00040100 \(park\+0\)',
         r'^\[hole\]   no job running',
         r'above ea=0x00040300 \(park\+512\) .*job=#2\(0x00010100\)',
+        # Per image: job A (image 5) PUT once, job B (image 6) did a GET, a
+        # GETLLAR and a PUT; both wrote at or near the park, so both histories.
+        r'^\[hole\]   image 5: 0 GETs, 1 PUTs, 0 atomics; .* 1 PUTs while the park stood$',
+        r'^\[hole\]   image 6: 1 GETs, 1 PUTs, 1 atomics; newest GET t-[0-9.]+ms, PUT t-[0-9.]+ms,'
+        r' atomic t-[0-9.]+ms; 1 PUTs while the park stood$',
+        r'^\[hole\]   image 5, last 1 operations \(oldest first\):\n'
+        r'\[hole\]     PUT cmd=0x20 ea=0x00040100 size=16 ',
+        r'^\[hole\]   image 6, last 3 operations \(oldest first\):\n'
+        r'\[hole\]     GET cmd=0x40 ea=0x00050000 size=32 .*\n'
+        r'\[hole\]     GETLLAR cmd=0xD0 ea=0x00060000 size=128 .*\n'
+        r'\[hole\]     PUT cmd=0x20 ea=0x00040300 size=16 ',
     ], 'report 1 (a PUT covered the park, then the park was written back)')
 
     expect(section(err, 2), [

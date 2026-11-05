@@ -184,7 +184,13 @@ void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
  *   - the jobs whose descriptor or input names the park (its EA or its IO
  *     offset), with every PUT each of them issued;
  *   - the jobs still running;
- *   - the PUTs nearest the park on either side.
+ *   - the PUTs nearest the park on either side;
+ *   - per image: its GETs, PUTs and atomics (GETLLAR/PUTLLC/PUTLLUC) so far,
+ *     its newest of each and how many PUTs it issued while the park stood,
+ *     and for the images that wrote at or near the park, their last 16
+ *     operations: whether the image that fills such holes was still alive,
+ *     and what it last read or polled. A SPURS task has no job record, so
+ *     this is the only trace of what it was doing.
  * GCM_HOLE_TRACE=<n> prints at most n reports (1 means the default, 6).
  *
  * Off (the default) it costs a NULL test per DMA (spu_dma.h) and one load
@@ -195,6 +201,7 @@ void (*g_spu_dma_note_hook)(spu_context* spu, uint32_t ea, uint32_t size,
                             const uint8_t* src, uint32_t cmd) = 0;
 void (*g_spu_hole_report_hook)(uint32_t io, uint32_t ea, uint32_t word,
                                uint32_t put, unsigned long long age_ms) = 0;
+void (*g_spu_atomic_note_hook)(spu_context* spu, uint32_t cmd, uint32_t ea) = 0;
 
 #define HT_PUTS (1u << 18)
 #define HT_JOBS (1u << 13)
@@ -221,8 +228,24 @@ typedef struct {
     uint32_t d[HT_SNAP], in[HT_SNAP];
 } HtJob;
 
+/* Per image (image_id, 63 = any id from 63 up): counts and the last
+ * HT_IMG_OPS operations of every kind. */
+#define HT_IMGS    64u
+#define HT_IMG_OPS 16u
+typedef struct {
+    uint64_t t;
+    uint32_t ea, size, pc;
+    uint8_t  cmd, thr;
+} HtOp;
+typedef struct {
+    uint32_t n_get, n_put, n_atom;
+    uint32_t w;                  /* operations claimed so far */
+    HtOp     op[HT_IMG_OPS];
+} HtImg;
+
 static HtPut*   s_ht_put;
 static HtJob*   s_ht_job;
+static HtImg*   s_ht_img;
 static uint32_t s_ht_put_n, s_ht_job_n, s_ht_thr_n;
 static int      s_ht_state;      /* 0 unknown, 1 off, 2 starting, 3 on */
 static int      s_ht_reports = 6;
@@ -265,16 +288,39 @@ static HtJob* ht_cur_job(void)
     return __atomic_load_n(&j->seq, __ATOMIC_RELAXED) == s ? j : 0;
 }
 
+static uint32_t ht_img_slot(const spu_context* spu)
+{
+    return (uint32_t)spu->image_id < HT_IMGS ? (uint32_t)spu->image_id : HT_IMGS - 1u;
+}
+
+static void ht_img_op(spu_context* spu, uint32_t cmd, uint32_t ea, uint32_t size,
+                      uint32_t* counter)
+{
+    __atomic_add_fetch(counter, 1u, __ATOMIC_RELAXED);
+    HtImg* g = &s_ht_img[ht_img_slot(spu)];
+    const uint32_t k = __atomic_fetch_add(&g->w, 1u, __ATOMIC_RELAXED);
+    HtOp* o = &g->op[k & (HT_IMG_OPS - 1u)];
+    o->t = ht_now(); o->ea = ea; o->size = size; o->pc = spu->pc & SPU_LS_MASK;
+    o->cmd = (uint8_t)cmd; o->thr = ht_thr();
+}
+
+static void ht_note_atomic(spu_context* spu, uint32_t cmd, uint32_t ea)
+{
+    ht_img_op(spu, cmd, ea, 128u, &s_ht_img[ht_img_slot(spu)].n_atom);
+}
+
 static void ht_note_dma(spu_context* spu, uint32_t ea, uint32_t size,
                         const uint8_t* src, uint32_t cmd)
 {
     HtJob* j = ht_cur_job();
     if (cmd & 0x40u) {                         /* GET family */
         if (j) { j->n_get++; j->last_get = ea; }
+        ht_img_op(spu, cmd, ea, size, &s_ht_img[ht_img_slot(spu)].n_get);
         return;
     }
     if (!(cmd & 0x20u)) return;                /* not a PUT */
     if (j) j->n_put++;
+    ht_img_op(spu, cmd, ea, size, &s_ht_img[ht_img_slot(spu)].n_put);
     const uint32_t n = __atomic_fetch_add(&s_ht_put_n, 1u, __ATOMIC_RELAXED);
     HtPut* p = &s_ht_put[n & (HT_PUTS - 1u)];
     __atomic_store_n(&p->seq, 0u, __ATOMIC_RELAXED);
@@ -331,6 +377,7 @@ static void ht_report(uint32_t io, uint32_t ea, uint32_t word, uint32_t put,
     const uint32_t j0 = jn > HT_JOBS ? jn - HT_JOBS : 0;
     const HtPut* first_put = pn > p0 ? &s_ht_put[p0 & (HT_PUTS - 1u)] : 0;
     const HtJob* first_job = jn > j0 ? &s_ht_job[j0 & (HT_JOBS - 1u)] : 0;
+    uint64_t near_imgs = 0;      /* images of the PUTs at or near the park */
     fprintf(stderr, "[hole] #%d park io=0x%08X ea=0x%08X word=%08X put=0x%08X standing %llu ms;"
                     " kept %u PUTs (back %.1f ms) and %u jobs (back %.1f ms)\n",
             rep, io, ea, word, put, age_ms, pn - p0,
@@ -360,8 +407,11 @@ static void ht_report(uint32_t io, uint32_t ea, uint32_t word, uint32_t put,
       if (!total) fprintf(stderr, "[hole]   no kept PUT covers the park\n");
       else fprintf(stderr, "[hole]   %d kept PUT(s) cover the park%s:\n", total,
                    total > 16 ? " (the last 16)" : "");
-      for (int i = 0; i < nh; i++)
-          ht_print_put("cover", &s_ht_put[hit[i] & (HT_PUTS - 1u)], ea, now); }
+      for (int i = 0; i < nh; i++) {
+          const HtPut* p = &s_ht_put[hit[i] & (HT_PUTS - 1u)];
+          near_imgs |= 1ull << (p->img < HT_IMGS ? p->img : HT_IMGS - 1u);
+          ht_print_put("cover", p, ea, now);
+      } }
 
     /* Jobs whose descriptor or input names the park, newest first. */
     { int named = 0;
@@ -421,10 +471,56 @@ static void ht_report(uint32_t io, uint32_t ea, uint32_t word, uint32_t put,
       }
       for (int pass = 0; pass < 2; pass++) {
           uint32_t* set = pass ? above : below; const int cnt = pass ? na : nb;
-          for (int i = 0; i < cnt; i++)
-              ht_print_put(pass ? "above" : "below", &s_ht_put[set[i] & (HT_PUTS - 1u)], ea, now);
+          for (int i = 0; i < cnt; i++) {
+              const HtPut* p = &s_ht_put[set[i] & (HT_PUTS - 1u)];
+              near_imgs |= 1ull << (p->img < HT_IMGS ? p->img : HT_IMGS - 1u);
+              ht_print_put(pass ? "above" : "below", p, ea, now);
+          }
       }
       if (!nb && !na) fprintf(stderr, "[hole]   no kept PUT within 0x2000 bytes of the park\n"); }
+
+    /* Per image: alive while the park stood? What did the near ones do last? */
+    { uint32_t stand[HT_IMGS] = {0};
+      uint64_t newest_put[HT_IMGS] = {0};
+      const uint64_t since = now - (uint64_t)age_ms * 1000000ull;
+      for (uint32_t n = p0; n < pn; n++) {
+          const HtPut* p = &s_ht_put[n & (HT_PUTS - 1u)];
+          if (p->seq != n + 1u) continue;
+          const uint32_t im = p->img < HT_IMGS ? p->img : HT_IMGS - 1u;
+          if (p->t >= since) stand[im]++;
+          if (p->t > newest_put[im]) newest_put[im] = p->t;
+      }
+      for (uint32_t im = 0; im < HT_IMGS; im++) {
+          const HtImg* g = &s_ht_img[im];
+          if (!g->n_get && !g->n_put && !g->n_atom) continue;
+          uint64_t newest[3] = {0, 0, 0};     /* GET, PUT, atomic among the last ops */
+          for (uint32_t k = 0; k < HT_IMG_OPS; k++) {
+              const HtOp* o = &g->op[k];
+              const int kind = (o->cmd & 0x80u) ? 2 : (o->cmd & 0x40u) ? 0 : 1;
+              if (o->t > newest[kind]) newest[kind] = o->t;
+          }
+          if (newest_put[im] > newest[1]) newest[1] = newest_put[im];
+          fprintf(stderr, "[hole]   image %u%s: %u GETs, %u PUTs, %u atomics; newest GET t-%.2fms,"
+                          " PUT t-%.2fms, atomic t-%.2fms; %u PUTs while the park stood\n",
+                  im, im == HT_IMGS - 1u ? "+" : "", g->n_get, g->n_put, g->n_atom,
+                  ht_ago_ms(now, newest[0]), ht_ago_ms(now, newest[1]),
+                  ht_ago_ms(now, newest[2]), stand[im]);
+      }
+      for (uint32_t im = 0; im < HT_IMGS; im++) {
+          if (!(near_imgs & (1ull << im))) continue;
+          const HtImg* g = &s_ht_img[im];
+          const uint32_t w = __atomic_load_n(&g->w, __ATOMIC_ACQUIRE);
+          const uint32_t k0 = w > HT_IMG_OPS ? w - HT_IMG_OPS : 0;
+          fprintf(stderr, "[hole]   image %u, last %u operations (oldest first):\n", im, w - k0);
+          for (uint32_t k = k0; k < w; k++) {
+              const HtOp* o = &g->op[k & (HT_IMG_OPS - 1u)];
+              const char* what = o->cmd == 0xD0u ? "GETLLAR" : o->cmd == 0xB4u ? "PUTLLC"
+                               : o->cmd == 0xB0u ? "PUTLLUC" : o->cmd == 0xB8u ? "PUTQLLUC"
+                               : (o->cmd & 0x40u) ? "GET" : "PUT";
+              fprintf(stderr, "[hole]     %s cmd=0x%02X ea=0x%08X size=%u pc=0x%05X thr=%u t-%.2fms\n",
+                      what, o->cmd, o->ea, o->size, o->pc, o->thr, ht_ago_ms(now, o->t));
+          }
+      } }
     fflush(stderr);
 }
 
@@ -445,14 +541,17 @@ static int ht_on(void)
         return expect == 3;
     s_ht_put = (HtPut*)calloc(HT_PUTS, sizeof *s_ht_put);
     s_ht_job = (HtJob*)calloc(HT_JOBS, sizeof *s_ht_job);
-    if (!s_ht_put || !s_ht_job) {
-        free(s_ht_put); free(s_ht_job); s_ht_put = 0; s_ht_job = 0;
+    s_ht_img = (HtImg*)calloc(HT_IMGS, sizeof *s_ht_img);
+    if (!s_ht_put || !s_ht_job || !s_ht_img) {
+        free(s_ht_put); free(s_ht_job); free(s_ht_img);
+        s_ht_put = 0; s_ht_job = 0; s_ht_img = 0;
         fprintf(stderr, "[hole-trace] no memory for the trace -- off\n");
         __atomic_store_n(&s_ht_state, 1, __ATOMIC_RELEASE);
         return 0;
     }
     { const int n = atoi(e); if (n > 1) s_ht_reports = n; }
     g_spu_dma_note_hook = ht_note_dma;
+    g_spu_atomic_note_hook = ht_note_atomic;
     g_spu_hole_report_hook = ht_report;
     fprintf(stderr, "[hole-trace] on: the last %u SPU PUTs and %u jobs are kept;"
                     " at most %d reports\n", HT_PUTS, HT_JOBS, s_ht_reports);

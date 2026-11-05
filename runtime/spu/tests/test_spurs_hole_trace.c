@@ -31,6 +31,7 @@ uint32_t ppu_vm_size = 0;
 extern uint8_t g_vm_page_bitmap[65536 / 8];
 extern void (*g_spu_dma_note_hook)(spu_context*, uint32_t, uint32_t, const uint8_t*, uint32_t);
 extern void (*g_spu_hole_report_hook)(uint32_t, uint32_t, uint32_t, uint32_t, unsigned long long);
+extern void (*g_spu_atomic_note_hook)(spu_context*, uint32_t, uint32_t);
 
 #define JOB_A    0x00010000u
 #define JOB_B    0x00010100u
@@ -41,6 +42,7 @@ extern void (*g_spu_hole_report_hook)(uint32_t, uint32_t, uint32_t, uint32_t, un
 #define HOLE2    (CMD_BASE + 0x200u)
 #define HOLE3    (CMD_BASE + 0x400u)
 #define IN_EA    0x00050000u
+#define LOCK_EA  0x00060000u
 
 static void put32(uint32_t ea, uint32_t v)
 {
@@ -76,8 +78,30 @@ static void job_a(spu_context* c)          /* fills hole 1 */
     ls_put32(c, 0x8008, 0); ls_put32(c, 0x800C, 0);
     dma_put(c, 0x8000, HOLE1, 16);
 }
+/* A GET and a GETLLAR, so the per-image history has one of each kind. */
+static void dma_get(spu_context* c, uint32_t lsa, uint32_t ea, uint32_t size)
+{
+    u128 v; memset(&v, 0, sizeof v);
+    v._u32[0] = lsa;         spu_wrch(c, MFC_LSA, v);
+    v._u32[0] = 0;           spu_wrch(c, MFC_EAH, v);
+    v._u32[0] = ea;          spu_wrch(c, MFC_EAL, v);
+    v._u32[0] = size;        spu_wrch(c, MFC_Size, v);
+    v._u32[0] = 2;           spu_wrch(c, MFC_TagID, v);
+    v._u32[0] = MFC_GET_CMD; spu_wrch(c, MFC_Cmd, v);
+}
+static void getllar(spu_context* c, uint32_t lsa, uint32_t ea)
+{
+    u128 v; memset(&v, 0, sizeof v);
+    v._u32[0] = lsa;             spu_wrch(c, MFC_LSA, v);
+    v._u32[0] = 0;               spu_wrch(c, MFC_EAH, v);
+    v._u32[0] = ea;              spu_wrch(c, MFC_EAL, v);
+    v._u32[0] = MFC_GETLLAR_CMD; spu_wrch(c, MFC_Cmd, v);
+}
+
 static void job_b(spu_context* c)          /* misses hole 2 */
 {
+    dma_get(c, 0x9000, IN_EA, 32);
+    getllar(c, 0x9080, LOCK_EA);
     ls_put32(c, 0x8000, 0x0004BEEFu); ls_put32(c, 0x8004, 0x11112222u);
     dma_put(c, 0x8000, HOLE2 + 0x100u, 16);
 }
@@ -113,11 +137,12 @@ int main(int argc, char** argv)
 
     spu_run_spurs_job(job_a, 5, JOB_A, 256);
     if (off) {
-        printf("off: dma hook %s, report hook %s\n",
-               g_spu_dma_note_hook ? "SET" : "null", g_spu_hole_report_hook ? "SET" : "null");
+        printf("off: dma hook %s, report hook %s, atomic hook %s\n",
+               g_spu_dma_note_hook ? "SET" : "null", g_spu_hole_report_hook ? "SET" : "null",
+               g_spu_atomic_note_hook ? "SET" : "null");
         return 0;
     }
-    if (!g_spu_dma_note_hook || !g_spu_hole_report_hook) {
+    if (!g_spu_dma_note_hook || !g_spu_hole_report_hook || !g_spu_atomic_note_hook) {
         printf("FAIL: GCM_HOLE_TRACE set but the hooks are not installed\n");
         return 1;
     }
