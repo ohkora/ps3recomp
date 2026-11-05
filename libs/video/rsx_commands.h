@@ -102,6 +102,7 @@ extern "C" {
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
 #define NV4097_DRAW_ARRAYS                     0x00001814
+#define NV4097_INLINE_ARRAY                    0x00001818
 #define NV4097_SET_INDEX_ARRAY_ADDRESS         0x0000181C
 #define NV4097_SET_INDEX_ARRAY_DMA             0x00001820
 #define NV4097_DRAW_INDEX_ARRAY                0x00001824
@@ -236,6 +237,10 @@ extern "C" {
 #define RSX_MAX_VERTEX_TEXTURES    4
 #define RSX_MAX_VERTEX_ATTRIBS    16
 #define RSX_MAX_RENDER_TARGETS     4
+/* Cap on one INLINE_ARRAY stream (one BEGIN/END), as in rsx_dispatch.h:
+ * several hundred vertices of a fat format. A longer stream is dropped and
+ * counted rather than drawn half-read. */
+#define RSX_INLINE_MAX_BYTES   65536u
 
 typedef struct rsx_texture_state {
     u32 offset;
@@ -350,6 +355,24 @@ typedef struct rsx_state {
     /* Current draw state */
     u32 primitive_type;
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
+
+    /* INLINE_ARRAY (0x1818): a primitive whose vertices travel in the FIFO
+     * itself instead of a vertex array. rsx_process_method collects the words
+     * between BEGIN_END(prim) and BEGIN_END(0) into inline_buf (guest byte
+     * order, allocated on first use, at most RSX_INLINE_MAX_BYTES) and issues
+     * them at the END as one draw_arrays(prim, 0, n). While that call runs,
+     * inline_src is set: rsx_fetch_attrib then reads attribute i of vertex v
+     * at inline_src + v * inline_stride + inline_off[i] instead of guest
+     * memory. The layout is the VTXFMT declaration: enabled attributes packed
+     * in ascending index order (rsx_vertex_inline_layout's rule).
+     * inline_dropped counts streams too long to keep. */
+    u8* inline_buf;
+    u32 inline_len;
+    u32 inline_dropped;
+    const u8* inline_src;
+    u32 inline_bytes;
+    u32 inline_stride;
+    u32 inline_off[RSX_MAX_VERTEX_ATTRIBS];
 
     /* Index array (SET_INDEX_ARRAY_ADDRESS/_DMA): offset is a raw RSX offset;
      * dma bits [3:0] = location context (0=local 1=main via CELL_GCM_DMA ids),

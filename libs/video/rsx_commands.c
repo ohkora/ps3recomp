@@ -15,6 +15,7 @@
  */
 
 #include "rsx_commands.h"
+#include "rsx_vertex_formats.h" /* rsx_vertex_attrib_size: INLINE_ARRAY layout */
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -429,6 +430,41 @@ int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
         return 1;
     }
     return 0;
+}
+
+/* Draw the INLINE_ARRAY primitive collected since its BEGIN (see the note on
+ * inline_buf in rsx_commands.h). The layout rule is rsx_vertex_inline_layout's
+ * (rsx_vertex_compact.c), which the dispatch engines use for the same stream:
+ * enabled attributes packed in ascending index order, one vertex every
+ * max(declared stride) bytes, or the packed size when none is declared. */
+static void rsx_draw_inline(rsx_state* state)
+{
+    const u32 len = state->inline_len;
+    state->inline_len = 0;
+    if (len == ~0u) return;                    /* dropped: over the cap */
+    u32 packed = 0, declared = 0;
+    for (u32 i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++) {
+        const rsx_vertex_attrib* a = &state->vertex_attribs[i];
+        state->inline_off[i] = packed;
+        if (!a->type || !a->size) continue;
+        packed += rsx_vertex_attrib_size(a->type, a->size);
+        if (a->stride > declared) declared = a->stride;
+    }
+    const u32 stride = declared ? declared : packed;
+    const u32 count = stride ? len / stride : 0;
+    { static int _d = 0; if (PS3_LOG_FIRST(_d, 8))
+        fprintf(stderr, "[RSX] INLINE_ARRAY prim=%u bytes=%u stride=%u vertices=%u\n",
+                state->primitive_type, len, stride, count); }
+    if (!count) return;
+    ps3_ms("rsx:draw_inline");
+    if (s_backend && s_backend->draw_arrays) {
+        state->inline_src = state->inline_buf;
+        state->inline_bytes = len;
+        state->inline_stride = stride;
+        s_backend->draw_arrays(s_backend->userdata, state->primitive_type, 0, count);
+        state->inline_src = NULL;
+        state->inline_bytes = 0;
+    }
 }
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
@@ -864,6 +900,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
+            state->inline_len = 0;
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {
@@ -906,8 +943,40 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 state->texture_dirty = 0;
             }
         } else {
+            /* The END of an inline primitive is its draw: the vertices came
+             * down between the BEGIN and here (INLINE_ARRAY below). */
+            if (state->inline_len)
+                rsx_draw_inline(state);
             state->in_begin_end = 0;
         }
+        return 0;
+    }
+
+    /* INLINE_ARRAY: the vertex stream travels in the FIFO itself, one data
+     * word per method call, between BEGIN_END(prim) and BEGIN_END(0). There
+     * is no (first, count) and no array offset. Titles draw small immediate
+     * batches this way: UI quads, text, debug geometry. The words were
+     * dropped here, so such a primitive never reached the backend at all. */
+    if (method == NV4097_INLINE_ARRAY) {
+        if (!state->in_begin_end) return 0;
+        if (!state->inline_buf) {
+            state->inline_buf = (u8*)malloc(RSX_INLINE_MAX_BYTES);
+            if (!state->inline_buf) return 0;
+        }
+        if (state->inline_len == ~0u) return 0;       /* this stream overflowed */
+        if (state->inline_len + 4u > RSX_INLINE_MAX_BYTES) {
+            /* Truncating would tear the last vertex: drop the whole stream. */
+            state->inline_dropped++;
+            { static int _o = 0; if (PS3_LOG_FIRST(_o, 4))
+                fprintf(stderr, "[RSX] INLINE_ARRAY stream over %u bytes dropped (prim=%u, %u so far)\n",
+                        RSX_INLINE_MAX_BYTES, state->primitive_type, state->inline_dropped); }
+            state->inline_len = ~0u;
+            return 0;
+        }
+        u8* p = state->inline_buf + state->inline_len;
+        p[0] = (u8)(data >> 24); p[1] = (u8)(data >> 16);
+        p[2] = (u8)(data >> 8);  p[3] = (u8)data;
+        state->inline_len += 4;
         return 0;
     }
 
