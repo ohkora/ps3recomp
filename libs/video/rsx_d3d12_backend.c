@@ -2948,6 +2948,21 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
     return out[1] | (out[2] << 3) | (out[3] << 6) | (out[0] << 9) | (1u << 12);
 }
 
+/* The view mapping for a draw's texture unit u: its TEXTURE_CONTROL1 crossbar
+ * over the R,G,B,A order every colour resource here holds -- an uploaded guest
+ * texture (rsx_texture_layout decodes A8R8G8B8 to RGBA), a render target (the
+ * program wrote R,G,B,A) and the colour copy of a depth surface (dsconv writes
+ * the A8R8G8B8 bytes of the D24S8 word as R,G,B,A) alike. B8 is presented on
+ * every lane. A render target or depth copy used to be bound with the identity
+ * mapping whatever the crossbar said, so a title that reorders the channels
+ * where it reads one back (to decode a depth or a packed value, say) read
+ * other channels than on hardware. */
+static UINT dr_tex_mapping(const D3D12DrawRecord* dr, int u)
+{
+    const u32 bf = dr->tex[u].fmt & 0x9Fu;
+    return (bf == 0x81) ? 0x1000 : rsx_remap_to_d3d(dr->tex[u].ctrl1, bf);
+}
+
 /* Morton/Z-order texel offset for RSX swizzled textures (LN bit clear).
  * Interleaves x (even bit positions) and y (odd) until the smaller dimension's
  * bits run out, then the larger dimension's remaining bits ride above -- the
@@ -5023,7 +5038,7 @@ static void render_frame(void)
                     dr->tex_rt[_u] = crt;
                     dr->tex_ds[_u] = ds;
                     srv_write(wslot, s_d3d.off_rt[crt].res, (DXGI_FORMAT)s_d3d.off_rt[crt].dxgi,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                              dr_tex_mapping(dr, _u));
                     continue;
                 }
             }
@@ -5069,12 +5084,11 @@ static void render_frame(void)
                 if (rt >= 0) {
                     dr->tex_rt[_u] = rt;
                     srv_write(wslot, s_d3d.off_rt[rt].res, (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                              dr_tex_mapping(dr, _u));
                     continue;
                 }
                 /* Any other format is uploaded from guest memory, decoded
                  * through rsx_texture_layout, as the draw engine does. */
-                u32 _bf = dr->tex[_u].fmt & 0x9F;
                 if (dr->tex[_u].off) {
                     double _tt = perf_on() ? perf_now() : 0.0;
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
@@ -5091,9 +5105,7 @@ static void render_frame(void)
                         rsx_tex_layout _tl;
                         rsx_texture_layout(dr->tex[_u].fmt, dr->tex[_u].w, dr->tex[_u].h, &_tl);
                         srv_write_ex(wslot, s_d3d.vp_tex[ts].res, vp_texfmt_dxgi(_tl.fmt),
-                                  (_bf == 0x81) ? 0x1000
-                                                : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
-                                  _cube);
+                                     dr_tex_mapping(dr, _u), _cube);
                         if (_cube) dr->tex_cube_srv |= 1u << _u;
                         continue;
                     }
