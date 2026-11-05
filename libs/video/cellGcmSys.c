@@ -2378,6 +2378,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                   * commands it just wrote. */
                                  vm_read32(gcm_io2ea(s_fifo_getoff)) == w) {
                           park_off = 0;
+                          /* GCM_HOLE_TRACE: which SPU PUTs and jobs touched
+                           * or named this park (runtime/spu/spurs_job.c). */
+                          { extern void (*g_spu_hole_report_hook)(u32, u32, u32, u32,
+                                                                  unsigned long long);
+                            if (g_spu_hole_report_hook)
+                                g_spu_hole_report_hook(s_fifo_getoff, gcm_io2ea(s_fifo_getoff),
+                                                       w, put, now - park_since); }
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
                       }

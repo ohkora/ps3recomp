@@ -43,6 +43,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#ifdef _WIN32
+#  include <windows.h>     /* QueryPerformanceCounter, for GCM_HOLE_TRACE */
+#else
+#  include <time.h>
+#endif
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
@@ -154,6 +159,335 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
  * two jobs that both think they are SPU 0 corrupt each other's ring. */
 SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
 void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
+
+/* ---------------------------------------------------------------------------
+ * GCM_HOLE_TRACE=1: who fills each command-buffer hole.
+ *
+ * A title whose SPU jobs write draws into the RSX command stream leaves each
+ * job a hole: the PPU parks the RSX on a self-JUMP at the hole's start, goes
+ * on writing commands after it, and the job PUTs its commands over the hole.
+ * PlayStation All-Stars Battle Royale leaves one hole a frame standing from
+ * some point on -- with a chain's jobs on several host threads and on one --
+ * and the RSX waits on it until the FIFO walker gives up on the park
+ * (cellGcmSys.c, "jump-park"). Nothing said which job owned the hole, whether
+ * it ran, or where its PUTs went.
+ *
+ * Armed, this keeps the last HT_PUTS SPU PUTs (destination, size, the word
+ * each replaced and the first two it wrote, the job, SPU number, host thread,
+ * image and pc that issued it) and the last HT_JOBS jobs (descriptor EA, the
+ * first 256 bytes of the descriptor and of the input buffer, the host thread
+ * and SPU number, when it started and ended, how many GETs and PUTs, its last
+ * GET source). When the walker gives up on a park it calls
+ * g_spu_hole_report_hook, which prints "[hole]" lines:
+ *   - the words around the park as they stand;
+ *   - every kept PUT that covered the park, oldest first;
+ *   - the jobs whose descriptor or input names the park (its EA or its IO
+ *     offset), with every PUT each of them issued;
+ *   - the jobs still running;
+ *   - the PUTs nearest the park on either side.
+ * GCM_HOLE_TRACE=<n> prints at most n reports (1 means the default, 6).
+ *
+ * Off (the default) it costs a NULL test per DMA (spu_dma.h) and one load
+ * per job. The hooks are defined here so the DMA engine and the GCM walker
+ * need no other link-time partner.
+ * -----------------------------------------------------------------------*/
+void (*g_spu_dma_note_hook)(spu_context* spu, uint32_t ea, uint32_t size,
+                            const uint8_t* src, uint32_t cmd) = 0;
+void (*g_spu_hole_report_hook)(uint32_t io, uint32_t ea, uint32_t word,
+                               uint32_t put, unsigned long long age_ms) = 0;
+
+#define HT_PUTS (1u << 18)
+#define HT_JOBS (1u << 13)
+#define HT_SNAP 64u              /* words kept from a descriptor / an input */
+
+typedef struct {
+    uint64_t t;                  /* host ns */
+    uint32_t seq;                /* claim number + 1; 0 while being written */
+    uint32_t ea, size;
+    uint32_t old0;               /* the word at ea before the PUT */
+    uint32_t new0, new1;         /* the first two words it wrote */
+    uint32_t job;                /* the issuing job's seq, 0 = not a job */
+    uint32_t pc;
+    uint16_t img; uint8_t spu, thr;
+} HtPut;
+
+typedef struct {
+    uint64_t t0, t1;             /* host ns; t1 = 0 while running */
+    uint32_t seq;
+    uint32_t ea;
+    uint32_t n_get, n_put, last_get;
+    uint16_t img; uint8_t spu, thr;
+    uint32_t nd, ni;             /* words kept in d[] and in[] */
+    uint32_t d[HT_SNAP], in[HT_SNAP];
+} HtJob;
+
+static HtPut*   s_ht_put;
+static HtJob*   s_ht_job;
+static uint32_t s_ht_put_n, s_ht_job_n, s_ht_thr_n;
+static int      s_ht_state;      /* 0 unknown, 1 off, 2 starting, 3 on */
+static int      s_ht_reports = 6;
+static SPURS_JOB_TLS uint32_t t_ht_job;   /* seq of the job this thread runs */
+static SPURS_JOB_TLS uint32_t t_ht_thr;   /* small host thread number */
+
+static uint64_t ht_now(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)(c.QuadPart / f.QuadPart) * 1000000000ull
+         + (uint64_t)(c.QuadPart % f.QuadPart) * 1000000000ull / (uint64_t)f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static uint32_t ht_be32(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static uint8_t ht_thr(void)
+{
+    if (!t_ht_thr) t_ht_thr = __atomic_add_fetch(&s_ht_thr_n, 1, __ATOMIC_RELAXED);
+    return (uint8_t)t_ht_thr;
+}
+
+/* The record of the job this thread is running, or NULL. */
+static HtJob* ht_cur_job(void)
+{
+    const uint32_t s = t_ht_job;
+    if (!s) return 0;
+    HtJob* j = &s_ht_job[(s - 1u) & (HT_JOBS - 1u)];
+    return __atomic_load_n(&j->seq, __ATOMIC_RELAXED) == s ? j : 0;
+}
+
+static void ht_note_dma(spu_context* spu, uint32_t ea, uint32_t size,
+                        const uint8_t* src, uint32_t cmd)
+{
+    HtJob* j = ht_cur_job();
+    if (cmd & 0x40u) {                         /* GET family */
+        if (j) { j->n_get++; j->last_get = ea; }
+        return;
+    }
+    if (!(cmd & 0x20u)) return;                /* not a PUT */
+    if (j) j->n_put++;
+    const uint32_t n = __atomic_fetch_add(&s_ht_put_n, 1u, __ATOMIC_RELAXED);
+    HtPut* p = &s_ht_put[n & (HT_PUTS - 1u)];
+    __atomic_store_n(&p->seq, 0u, __ATOMIC_RELAXED);
+    p->t    = ht_now();
+    p->ea   = ea;
+    p->size = size;
+    p->old0 = size >= 4 ? ht_be32(vm_base + ea) : 0;   /* called before the copy */
+    p->new0 = size >= 4 ? ht_be32(src) : 0;
+    p->new1 = size >= 8 ? ht_be32(src + 4) : 0;
+    p->job  = j ? t_ht_job : 0;
+    p->pc   = spu->pc & SPU_LS_MASK;
+    p->img  = (uint16_t)spu->image_id;
+    p->spu  = (uint8_t)g_spurs_job_spu_num;
+    p->thr  = ht_thr();
+    __atomic_store_n(&p->seq, n + 1u, __ATOMIC_RELEASE);
+}
+
+static double ht_ago_ms(uint64_t now, uint64_t t)
+{
+    return t && t <= now ? (double)(now - t) / 1e6 : -1.0;
+}
+
+static void ht_print_put(const char* tag, const HtPut* p, uint32_t park, uint64_t now)
+{
+    const HtJob* j = p->job ? &s_ht_job[(p->job - 1u) & (HT_JOBS - 1u)] : 0;
+    const uint32_t jea = (j && j->seq == p->job) ? j->ea : 0;
+    fprintf(stderr, "[hole]   %s ea=0x%08X (park%+d) size=%u old=%08X new=%08X %08X"
+                    " job=#%u(0x%08X) img=%u spu=%u thr=%u pc=0x%05X t-%.2fms\n",
+            tag, p->ea, (int)(p->ea - park), p->size, p->old0, p->new0, p->new1,
+            p->job, jea, p->img, p->spu, p->thr, p->pc, ht_ago_ms(now, p->t));
+}
+
+static void ht_print_job(const char* tag, const HtJob* j, uint64_t now, const char* where)
+{
+    fprintf(stderr, "[hole]   %s job #%u ea=0x%08X img=%u spu=%u thr=%u started t-%.2fms %s%.2fms%s%s,"
+                    " %u GETs (last 0x%08X), %u PUTs\n",
+            tag, j->seq, j->ea, j->img, j->spu, j->thr, ht_ago_ms(now, j->t0),
+            j->t1 ? "ended t-" : "still running after ",
+            j->t1 ? ht_ago_ms(now, j->t1) : ht_ago_ms(now, j->t0),
+            where ? ", names the park at " : "", where ? where : "",
+            j->n_get, j->last_get, j->n_put);
+}
+
+static void ht_report(uint32_t io, uint32_t ea, uint32_t word, uint32_t put,
+                      unsigned long long age_ms)
+{
+    static int n_rep;
+    if (n_rep >= s_ht_reports) return;
+    const int rep = ++n_rep;
+    const uint64_t now = ht_now();
+    const uint32_t pn = __atomic_load_n(&s_ht_put_n, __ATOMIC_ACQUIRE);
+    const uint32_t jn = __atomic_load_n(&s_ht_job_n, __ATOMIC_ACQUIRE);
+    const uint32_t p0 = pn > HT_PUTS ? pn - HT_PUTS : 0;
+    const uint32_t j0 = jn > HT_JOBS ? jn - HT_JOBS : 0;
+    const HtPut* first_put = pn > p0 ? &s_ht_put[p0 & (HT_PUTS - 1u)] : 0;
+    const HtJob* first_job = jn > j0 ? &s_ht_job[j0 & (HT_JOBS - 1u)] : 0;
+    fprintf(stderr, "[hole] #%d park io=0x%08X ea=0x%08X word=%08X put=0x%08X standing %llu ms;"
+                    " kept %u PUTs (back %.1f ms) and %u jobs (back %.1f ms)\n",
+            rep, io, ea, word, put, age_ms, pn - p0,
+            first_put ? ht_ago_ms(now, first_put->t) : 0.0, jn - j0,
+            first_job ? ht_ago_ms(now, first_job->t0) : 0.0);
+    /* The command words around the park, as they stand now. */
+    if (ea >= 32u) {
+        char line[512]; int o = 0;
+        for (int i = -8; i < 24; i++) {
+            o += snprintf(line + o, sizeof line - (size_t)o, "%s%08X", i == 0 ? " [" : " ",
+                          ht_be32(vm_base + (uint32_t)(ea + (uint32_t)(i * 4))));
+            if (i == 0) o += snprintf(line + o, sizeof line - (size_t)o, "]");
+        }
+        fprintf(stderr, "[hole]   words park-32..park+92:%s\n", line);
+    }
+
+    /* PUTs that covered the park word, oldest first (at most 16, newest kept). */
+    { uint32_t hit[16]; int nh = 0, total = 0;
+      for (uint32_t n = p0; n < pn; n++) {
+          const HtPut* p = &s_ht_put[n & (HT_PUTS - 1u)];
+          if (p->seq != n + 1u) continue;
+          if (ea < p->ea || ea >= p->ea + p->size) continue;
+          total++;
+          if (nh == 16) { memmove(hit, hit + 1, sizeof hit[0] * 15u); nh = 15; }
+          hit[nh++] = n;
+      }
+      if (!total) fprintf(stderr, "[hole]   no kept PUT covers the park\n");
+      else fprintf(stderr, "[hole]   %d kept PUT(s) cover the park%s:\n", total,
+                   total > 16 ? " (the last 16)" : "");
+      for (int i = 0; i < nh; i++)
+          ht_print_put("cover", &s_ht_put[hit[i] & (HT_PUTS - 1u)], ea, now); }
+
+    /* Jobs whose descriptor or input names the park, newest first. */
+    { int named = 0;
+      for (uint32_t n = jn; n-- > j0 && named < 6; ) {
+          const HtJob* j = &s_ht_job[n & (HT_JOBS - 1u)];
+          if (j->seq != n + 1u) continue;
+          char where[48]; where[0] = 0;
+          for (uint32_t i = 0; i < j->nd && !where[0]; i++)
+              if (j->d[i] == ea || j->d[i] == io) snprintf(where, sizeof where, "desc+0x%X%s", i * 4u, j->d[i] == io ? " (io)" : "");
+          for (uint32_t i = 0; i < j->ni && !where[0]; i++)
+              if (j->in[i] == ea || j->in[i] == io) snprintf(where, sizeof where, "in+0x%X%s", i * 4u, j->in[i] == io ? " (io)" : "");
+          if (!where[0]) continue;
+          named++;
+          ht_print_job("named", j, now, where);
+          int np = 0;
+          for (uint32_t m = p0; m < pn && np < 16; m++) {
+              const HtPut* p = &s_ht_put[m & (HT_PUTS - 1u)];
+              if (p->seq == m + 1u && p->job == j->seq) { ht_print_put("  its put", p, ea, now); np++; }
+          }
+          if (!np) fprintf(stderr, "[hole]     (no kept PUT from this job)\n");
+      }
+      if (!named) fprintf(stderr, "[hole]   no kept job descriptor or input names ea 0x%08X or io 0x%08X\n", ea, io); }
+
+    /* Jobs still running. */
+    { int nr = 0;
+      for (uint32_t n = jn; n-- > j0 && nr < 8; ) {
+          const HtJob* j = &s_ht_job[n & (HT_JOBS - 1u)];
+          if (j->seq != n + 1u || j->t1) continue;
+          nr++;
+          ht_print_job("running", j, now, 0);
+      }
+      if (!nr) fprintf(stderr, "[hole]   no job running\n"); }
+
+    /* The nearest PUTs below and above the park (the latest PUT per address). */
+    { uint32_t below[6], above[6]; int nb = 0, na = 0;
+      for (uint32_t n = pn; n-- > p0; ) {
+          const HtPut* p = &s_ht_put[n & (HT_PUTS - 1u)];
+          if (p->seq != n + 1u) continue;
+          if (ea >= p->ea && ea < p->ea + p->size) continue;      /* listed above */
+          const uint32_t d = p->ea < ea ? ea - p->ea : p->ea - ea;
+          if (d > 0x2000u) continue;
+          uint32_t* set = p->ea < ea ? below : above;
+          int* cnt = p->ea < ea ? &nb : &na;
+          int dup = 0;
+          for (int i = 0; i < *cnt; i++)
+              if (s_ht_put[set[i] & (HT_PUTS - 1u)].ea == p->ea) { dup = 1; break; }
+          if (dup) continue;
+          if (*cnt < 6) { set[(*cnt)++] = n; continue; }
+          /* Keep the six closest: replace the farthest if this one is closer. */
+          int far_i = 0; uint32_t far_d = 0;
+          for (int i = 0; i < 6; i++) {
+              const uint32_t e = s_ht_put[set[i] & (HT_PUTS - 1u)].ea;
+              const uint32_t dd = e < ea ? ea - e : e - ea;
+              if (dd > far_d) { far_d = dd; far_i = i; }
+          }
+          if (d < far_d) set[far_i] = n;
+      }
+      for (int pass = 0; pass < 2; pass++) {
+          uint32_t* set = pass ? above : below; const int cnt = pass ? na : nb;
+          for (int i = 0; i < cnt; i++)
+              ht_print_put(pass ? "above" : "below", &s_ht_put[set[i] & (HT_PUTS - 1u)], ea, now);
+      }
+      if (!nb && !na) fprintf(stderr, "[hole]   no kept PUT within 0x2000 bytes of the park\n"); }
+    fflush(stderr);
+}
+
+/* Arm on the first job when GCM_HOLE_TRACE is set. */
+static int ht_on(void)
+{
+    int st = __atomic_load_n(&s_ht_state, __ATOMIC_ACQUIRE);
+    if (st == 3) return 1;
+    if (st != 0) return 0;
+    const char* e = getenv("GCM_HOLE_TRACE");
+    if (!e || !*e || (*e == '0' && !e[1])) {
+        __atomic_store_n(&s_ht_state, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    int expect = 0;
+    if (!__atomic_compare_exchange_n(&s_ht_state, &expect, 2, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return expect == 3;
+    s_ht_put = (HtPut*)calloc(HT_PUTS, sizeof *s_ht_put);
+    s_ht_job = (HtJob*)calloc(HT_JOBS, sizeof *s_ht_job);
+    if (!s_ht_put || !s_ht_job) {
+        free(s_ht_put); free(s_ht_job); s_ht_put = 0; s_ht_job = 0;
+        fprintf(stderr, "[hole-trace] no memory for the trace -- off\n");
+        __atomic_store_n(&s_ht_state, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    { const int n = atoi(e); if (n > 1) s_ht_reports = n; }
+    g_spu_dma_note_hook = ht_note_dma;
+    g_spu_hole_report_hook = ht_report;
+    fprintf(stderr, "[hole-trace] on: the last %u SPU PUTs and %u jobs are kept;"
+                    " at most %d reports\n", HT_PUTS, HT_JOBS, s_ht_reports);
+    __atomic_store_n(&s_ht_state, 3, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static void ht_job_begin(uint32_t job_ea, int image_id, uint32_t dsz,
+                         const uint8_t* ls, uint32_t io_ls, uint32_t io_used)
+{
+    t_ht_job = 0;
+    if (!ht_on()) return;
+    const uint32_t n = __atomic_fetch_add(&s_ht_job_n, 1u, __ATOMIC_RELAXED);
+    HtJob* j = &s_ht_job[n & (HT_JOBS - 1u)];
+    __atomic_store_n(&j->seq, 0u, __ATOMIC_RELAXED);
+    j->t0 = ht_now(); j->t1 = 0;
+    j->ea = job_ea;
+    j->n_get = j->n_put = j->last_get = 0;
+    j->img = (uint16_t)image_id;
+    j->spu = (uint8_t)g_spurs_job_spu_num;
+    j->thr = ht_thr();
+    j->nd = dsz / 4u < HT_SNAP ? dsz / 4u : HT_SNAP;
+    for (uint32_t i = 0; i < j->nd; i++) j->d[i] = g32(job_ea + i * 4u);
+    j->ni = io_ls ? (io_used / 4u < HT_SNAP ? io_used / 4u : HT_SNAP) : 0;
+    for (uint32_t i = 0; i < j->ni; i++) j->in[i] = ht_be32(ls + io_ls + i * 4u);
+    __atomic_store_n(&j->seq, n + 1u, __ATOMIC_RELEASE);
+    t_ht_job = n + 1u;
+}
+
+static void ht_job_end(void)
+{
+    HtJob* j = ht_cur_job();
+    if (j) j->t1 = ht_now();
+    t_ht_job = 0;
+}
 
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
@@ -362,6 +696,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
+    /* GCM_HOLE_TRACE: this job's descriptor and input, before it runs. */
+    ht_job_begin(job_ea, image_id, dsz, ls, io_ls, io_used);
+
     /* ---- enter the job -------------------------------------------------- */
     spu_context ctx;
     spu_context_init(&ctx, 0);
@@ -394,6 +731,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
     spu_run_with_halt(entry, &ctx);
+    ht_job_end();
 
     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
      * the SPU printf service, NOT query results -- value 0x83C0 from the sound

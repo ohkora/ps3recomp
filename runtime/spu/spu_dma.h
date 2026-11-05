@@ -566,6 +566,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             return 0;
         }
     }
+    /* Every transfer, before it moves a byte, to the GCM_HOLE_TRACE recorder
+     * (runtime/spu/spurs_job.c): a PUT's note keeps the word it replaces.
+     * NULL unless that trace is armed. */
+    { extern void (*g_spu_dma_note_hook)(spu_context*, uint32_t, uint32_t,
+                                         const uint8_t*, uint32_t);
+      if (g_spu_dma_note_hook)
+          g_spu_dma_note_hook(spu, (uint32_t)ea, size, ls_ptr, cmd); }
     if (mfc_is_get(cmd)) {
         /* LBP overlay-load diagnosis: a GET of the FMOD overlay descriptor
          * (32B from ~0x94Fxxx) then a large GET from a NULL source = the

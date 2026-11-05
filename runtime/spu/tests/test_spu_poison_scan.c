@@ -18,6 +18,7 @@ int g_cri_video_dma;
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 uint32_t g_barrier_sync_watch;
 void (*g_spu_put_hook)(uint32_t, uint32_t);
+void (*g_spu_dma_note_hook)(spu_context*, uint32_t, uint32_t, const uint8_t*, uint32_t);
 void* volatile g_sn_defer_ctx;
 volatile unsigned g_sn_defer;
 unsigned long long ps3_ms_now(void) { return 0; }
