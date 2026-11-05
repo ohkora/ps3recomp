@@ -70,13 +70,21 @@
  * own texScale/offset uniforms, so one per-frame snapshot ran every pass
  * with the LAST pass's constants. */
 #define VP_CB_STRIDE      8448
+/* How far the guest-FP path reads a fragment program, END included: the
+ * draw engine's bound (ENG_FP_MAX_BYTES). The buffered decompile and the
+ * constant collection both need the whole program up to its END, so a
+ * program longer than the window does not build at all. (The literal
+ * decompile this path used before cut such a program off at 4096 bytes and
+ * drew what was left.) */
+#define VP_FP_MAX_BYTES   0x10000u
 /* b1 per-draw FP slot: the PSConstants block rsx_fp_decompile_buffered_ex
  * declares, i.e. the program's inline constants (fp_constants[]) followed by
- * fp_alpha. A program is read from at most 4096 bytes, and each inline
- * constant takes the 16 bytes after its instruction, so a program has at most
- * 128: 129 float4 = 2064 B, rounded up to D3D12's 256-byte CBV alignment. */
-#define VP_FP_MAX_CONSTS  128
-#define VP_FPCB_STRIDE    2304
+ * fp_alpha. Room for 256 constants (each takes the 16 bytes after its
+ * instruction, so a 4096-byte program has at most 128): 257 float4 = 4112 B,
+ * rounded up to D3D12's 256-byte CBV alignment. A program with more does not
+ * build, and says so. */
+#define VP_FP_MAX_CONSTS  256
+#define VP_FPCB_STRIDE    4352
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 /* Texture units of the guest-FP path: t0-t15 and s0-s15. The FP decompiler
  * declares rsx_tex[16] and rsx_samp[16], so a program that samples unit N
@@ -2418,7 +2426,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * pipeline key move every draw. */
     u32 uhash;
     {
-        u32 usz = rsx_fp_program_size(vm_base + off, 4096);
+        u32 usz = rsx_fp_program_size(vm_base + off, VP_FP_MAX_BYTES);
         if (usz == 0) usz = 64;
         s_perf_pso_hashbytes += (int)usz;
         static int consts_inline = -1;
@@ -2429,7 +2437,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             const u8* up = vm_base + off;
             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
         } else {
-            uhash = rsx_fp_code_hash(vm_base + off, 4096);
+            uhash = rsx_fp_code_hash(vm_base + off, VP_FP_MAX_BYTES);
         }
     }
 
@@ -2528,16 +2536,21 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * code -- whatever constants the title had patched in since -- ran with the
      * ones the first draw compiled in. */
     u32 nconst = 0;
-    int n = rsx_fp_decompile_buffered_ex(vm_base + off, 4096, fp_ctrl, 0u,
+    int n = rsx_fp_decompile_buffered_ex(vm_base + off, VP_FP_MAX_BYTES, fp_ctrl, 0u,
                                          hlsl, sizeof(hlsl), &nconst);
-    if (n > 0 && nconst > VP_FP_MAX_CONSTS) n = -1;   /* would not fit b1 */
-    if (n > 0 && alpha) {
-        if (rsx_fp_apply_alpha_test_buffered(hlsl, sizeof(hlsl), alpha) < 0) n = -1;
-        else { static int _a = 0; if (PS3_LOG_FIRST(_a, 8))
-            printf("[FP] fp=0x%08X compiled with alpha test 0x%03X\n", fp_addr, alpha); }
-    }
-    if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr);
-                  vp_fp_remember(&key, NULL); return NULL; }
+    const char* why = NULL;
+    if (n <= 0)
+        why = rsx_fp_program_size(vm_base + off, VP_FP_MAX_BYTES) ? "decompile failed"
+                                                                  : "no END in the read window";
+    else if (nconst > VP_FP_MAX_CONSTS)
+        why = "more inline constants than b1 holds";
+    else if (alpha && rsx_fp_apply_alpha_test_buffered(hlsl, sizeof(hlsl), alpha) < 0)
+        why = "the alpha test could not be added";
+    if (why) { static int _e=0; if(PS3_LOG_FIRST(_e, 16))
+                   printf("[FP] decompile fail (fp=0x%08X): %s (%u constants)\n", fp_addr, why, nconst);
+               vp_fp_remember(&key, NULL); return NULL; }
+    if (alpha) { static int _a = 0; if (PS3_LOG_FIRST(_a, 8))
+        printf("[FP] fp=0x%08X compiled with alpha test 0x%03X\n", fp_addr, alpha); }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -3572,7 +3585,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
             if (vm_base && foff != 0xFFFFFFFFu) {
-                int nc = rsx_fp_collect_constants(vm_base + foff, 4096, &k);
+                int nc = rsx_fp_collect_constants(vm_base + foff, VP_FP_MAX_BYTES, &k);
                 if (nc > 0 && nc <= VP_FP_MAX_CONSTS) {
                     memcpy(cb, k.values, (size_t)nc * 16);
                     nk = (u32)nc;
