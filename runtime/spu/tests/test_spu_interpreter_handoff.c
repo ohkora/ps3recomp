@@ -50,6 +50,50 @@ static void nested_entry(spu_context* c) {
     c->gpr[20]._u32[0]++;
     finish(c);
 }
+/* `bisl $0,$5` at 0x500 into code nothing was lifted for, above the jm2 kernel
+ * base (SPU_INTERP_UNLIFTED's path), as the lifter emits it: link, dispatch,
+ * drain, then this frame's own continuation. */
+static void unlifted_call_entry(spu_context* c) {
+    c->gpr[0] = spu_link(0x504);
+    c->pc = 0x16000;
+    c->host_depth++;
+    spu_indirect_branch(c);
+    spu_drain_call(c, 0x504);
+    c->host_depth--;
+    c->gpr[20]._u32[0]++;
+    finish(c);
+}
+static void unlifted_tail_entry(spu_context* c) {
+    c->pc = 0x16000; g_spu_trampoline_fn = spu_indirect_branch;
+}
+/* Two drains deep: the outer call's drain runs a hop into a function that
+ * makes its own call, and that callee returns to an unlifted mid-function pc.
+ * The inner drain puts the outer drain's return pc back and restarts dispatch
+ * from the driver, which discards both host frames. */
+static void stray_return(spu_context* c) {
+    c->gpr[0] = spu_link(0x4100);
+    SPU_RET(c);
+}
+static void inner_call(spu_context* c) {
+    c->gpr[0] = spu_link(0x308);
+    c->host_depth++;
+    c->pc = 0x320;
+    spu_indirect_branch(c);
+    spu_drain_call(c, 0x308);
+    c->host_depth--;
+    c->gpr[20]._u32[0] += 10;   /* in a frame the restart discarded: never runs */
+    finish(c);
+}
+static void restart_entry(spu_context* c) {
+    c->gpr[0] = spu_link(0x204);
+    c->host_depth++;
+    c->pc = 0x300;
+    g_spu_trampoline_fn = spu_indirect_branch;   /* the call runs as a hop of this drain */
+    spu_drain_call(c, 0x204);
+    c->host_depth--;
+    c->gpr[20]._u32[0]++;
+    finish(c);
+}
 int main(int argc, char** argv) {
     assert(argc == 2);
     const char* mode = argv[1];
@@ -59,9 +103,13 @@ int main(int argc, char** argv) {
     ctx.status = SPU_STATUS_RUNNING;
     spu_begin_image(77);
     spu_register_function(0x200, helper);
-    if (strcmp(mode, "nested-return-unlifted"))
+    if (strcmp(mode, "nested-return-unlifted") && strcmp(mode, "restart-stale-return"))
         spu_register_function(0x204, wrong_continuation);
     spu_register_function(0x240, finish);
+    if (!strcmp(mode, "restart-stale-return")) {
+        spu_register_function(0x300, inner_call);
+        spu_register_function(0x320, stray_return);
+    }
     if (!strcmp(mode, "top-zero")) spu_register_function(0, finish);
     if (!strcmp(mode, "negative-stepcap")) {
         ctx.image_id = -1;
@@ -116,6 +164,30 @@ int main(int argc, char** argv) {
     } else if (!strcmp(mode, "stepcap") || !strcmp(mode, "negative-stepcap")) {
         word(0x4004, 0x04000082);
         word(0x4008, 0x30004800);
+    } else if (!strcmp(mode, "unlifted-call-return")) {
+        /* Run with SPU_INTERP_UNLIFTED=1. The interpreter must hand back at
+         * the call's return point, so the waiting host frame continues. */
+        entry = unlifted_call_entry; ctx.policy_mode = 0;
+        word(0x500, 0x35200280);   /* bisl $0,$5: the call site */
+        word(0x504, 0x1C004A95);   /* ai $21,$21,1: the caller's code, must NOT be interpreted */
+        word(0x508, 0x30004800);   /* bra 0x240 */
+        word(0x16000, 0x04000082); /* ori $2,$1,0 */
+        word(0x16004, 0x35000000); /* bi $0 -> 0x504 */
+    } else if (!strcmp(mode, "unlifted-top-rejoin")) {
+        /* SPU_INTERP_UNLIFTED=1, no enclosing call: the rejoin at a lifted
+         * entry is a transfer, and the top-level drain must run it. */
+        entry = unlifted_tail_entry; ctx.policy_mode = 0;
+        word(0x16000, 0x04000082); /* ori $2,$1,0 */
+        word(0x16004, 0x30004800); /* bra 0x240 */
+    } else if (!strcmp(mode, "restart-stale-return")) {
+        /* A return lands on unlifted 0x4100 two drains deep and the inner
+         * drain restarts dispatch. The outer drain's return pc (0x204) has
+         * no frame after that, so the interpreter must not stop there. */
+        entry = restart_entry;
+        word(0x4100, 0x04000082);  /* ori $2,$1,0: past the microstep set */
+        word(0x4104, 0x30004080);  /* bra 0x204 */
+        word(0x204, 0x1C004A95);   /* ai $21,$21,1: runs, from the driver */
+        word(0x208, 0x30004800);   /* bra 0x240 */
     } else if (!strcmp(mode, "pure-interpreter")) {
         word(0x4004, 0x30004800);
         uint32_t pc = spu_interp_run_until(&ctx, 0x4000, 0);
@@ -132,6 +204,15 @@ int main(int argc, char** argv) {
         assert(halted == 0 && ctx.status == SPU_STATUS_RUNNING);
         assert(ctx.pc == 0x4004 && ctx.gpr[11]._u32[0] == 0);
         assert(g_spu_trampoline_fn == NULL);
+        puts("PASS"); return 0;
+    }
+    if (!strcmp(mode, "restart-stale-return")) {
+        /* The restart took the host frames with it, so the caller's
+         * continuation at 0x204 runs interpreted from the driver, then the
+         * lifted finish. The run must not end at the dead return point. */
+        assert(halted == 1 && ctx.status == SPU_STATUS_STOPPED_BY_STOP);
+        assert(ctx.gpr[11]._u32[0] == 1 && ctx.gpr[21]._u32[0] == 1);
+        assert(ctx.gpr[20]._u32[0] == 0);
         puts("PASS"); return 0;
     }
     assert(ctx.gpr[21]._u32[0] == 0);
@@ -160,7 +241,8 @@ int main(int argc, char** argv) {
     }
     assert(halted == 1 && ctx.status == SPU_STATUS_STOPPED_BY_STOP);
     assert(ctx.gpr[11]._u32[0] == 1);
-    assert(ctx.gpr[20]._u32[0] == (!strncmp(mode, "nested-return", 13) ? 1u : 0u));
+    assert(ctx.gpr[20]._u32[0] == (!strncmp(mode, "nested-return", 13) ||
+                                    !strcmp(mode, "unlifted-call-return") ? 1u : 0u));
     assert(ctx.gpr[10]._u32[0] == (!strcmp(mode, "nested-calls") ? 2u : 0u));
     puts("PASS"); return 0;
 }

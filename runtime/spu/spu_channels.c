@@ -340,6 +340,10 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
         g_spu_trampoline_fn = 0;
+        /* The longjmp skipped every drain's exit, so drain_ret_pc still names
+         * a return point whose host frame is gone. An interpreter handoff that
+         * stopped there would come back with nothing queued and end the run. */
+        ctx->drain_ret_pc = 0;
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
         break;
@@ -2377,6 +2381,34 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
     ctx->gpr[3]._u32[0] = 0;
 }
 
+/* Where an interpreter run started from the dispatcher must give control back:
+ * the return point of the call that reached this code. It sits mid-function,
+ * so it is no lifted entry, and the call's host frame is waiting for exactly
+ * that pc.
+ *
+ * A lifted bisl writes its link and calls the dispatcher before its
+ * spu_drain_call sets drain_ret_pc, so for a direct call drain_ret_pc still
+ * names the enclosing call. The link names this one. When the word before $0
+ * is a call that links through $0, $0 is a return point: this call's, or for
+ * a tail transfer the caller's own, which is also where the tail-called code
+ * returns. A $0 equal to the start pc is the return point the guest is
+ * standing on, not one to stop at. Otherwise drain_ret_pc, as before. */
+static uint32_t spu_interp_return_stop(const spu_context* ctx, uint32_t start)
+{
+    const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK & ~3u;
+    if (lr >= 4 && lr != (start & SPU_LS_MASK & ~3u)) {
+        const uint8_t* p = ctx->ls + lr - 4;
+        const uint32_t w = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                           ((uint32_t)p[2] << 8) | p[3];
+        const uint32_t op9 = w >> 23, op11 = w >> 21;
+        if ((w & 0x7Fu) == 0 &&                                /* rt = $0 */
+            (op9 == 0x062 || op9 == 0x066 ||                   /* brasl, brsl */
+             op11 == 0x1A9 || op11 == 0x1AB))                  /* bisl, bisled */
+            return lr;
+    }
+    return ctx->drain_ret_pc;
+}
+
 /* ---------------------------------------------------------------------------
  * Micro-interpreter for RUNTIME-GENERATED stub code (SMC).
  *
@@ -2868,10 +2900,25 @@ void spu_indirect_branch(spu_context* ctx)
           if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
           if (s_iu && w0) {
               static int _n = 0;
+              /* Stop where the call that got here returns. Without a stop the
+               * interpreter ran on through the caller's code to the next
+               * lifted entry, the caller's host frame never got its return,
+               * and the rest of the run happened nested inside this call,
+               * with later returns landing mid-function. PlayStation
+               * All-Stars Battle Royale's first post-title tasks call an
+               * unlifted function this way, and ended before writing their
+               * results. */
+              const uint32_t stop = spu_interp_return_stop(ctx, p);
               if (PS3_LOG_FIRST(_n, 8))
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
-                          "(runtime-loaded code)\n", ctx->image_id, p);
-              spu_interp_run(ctx, p);
+                          "(runtime-loaded code) until 0x%05X\n", ctx->image_id, p, stop);
+              spu_interp_run_until(ctx, p, stop);
+              /* A rejoin anywhere else is a transfer to that lifted entry, as
+               * on the SMC handoff: queue it, or a top-level run ends here. */
+              if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
+                  (!stop || (ctx->pc & SPU_LS_MASK) != stop) &&
+                  spu_lifted_lookup(ctx, ctx->pc))
+                  g_spu_trampoline_fn = spu_indirect_branch;
               return;
           } }
         spu_halt(ctx);
