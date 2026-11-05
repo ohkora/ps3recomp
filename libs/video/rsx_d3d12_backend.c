@@ -2336,6 +2336,36 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     return m;
 }
 
+/* Cache a guest-FP pipeline under its key, or with pso NULL the fact that the
+ * key does not build. A program that fails to decompile, to compile or to make
+ * a pipeline fails the same way every time its key comes back, and it comes
+ * back on every draw that uses it: each retry is a full decompile + D3DCompile
+ * (30-40 ms on the FIFO drain thread), and the draw is skipped regardless.
+ * PlayStation All-Stars Battle Royale, while its arena programs still failed
+ * on texture units 4-7, had about 16 such draws a frame and crawled at
+ * 1.5-2 fps; remembering the failures, it ran at 18-20.
+ * Lookups return the NULL, so the caller takes its usual fallback at once.
+ * The VS generation is part of the key, so a failure is retried after the
+ * vertex-program cache is rebuilt. */
+static void vp_fp_remember(const VPFPEntry* key, ID3D12PipelineState* pso)
+{
+    /* insert (evict oldest when full) */
+    if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
+        if (s_d3d.vp_fp[0].pso) s_d3d.vp_fp[0].pso->lpVtbl->Release(s_d3d.vp_fp[0].pso);
+        memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
+        s_d3d.vp_fp_n = VP_FP_CACHE - 1;
+    }
+    s_d3d.vp_fp[s_d3d.vp_fp_n] = *key;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].pso = pso;
+    s_d3d.vp_fp_n++;
+    if (!pso) {
+        static int n = 0;
+        if (PS3_LOG_FIRST(n, 16))
+            printf("[FP] fp=0x%08X ucode %08X does not build; its draws skip it from now on\n",
+                   key->fp_addr, key->ucode_hash);
+    }
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
                                           u32 cube_mask, u64 zs)
@@ -2398,8 +2428,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].zs == zs)
-            return s_d3d.vp_fp[i].pso;
+            return s_d3d.vp_fp[i].pso;   /* NULL: this key is known not to build */
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
+    VPFPEntry key;
+    memset(&key, 0, sizeof key);
+    key.fp_addr = fp_addr;  key.vs_idx = vs_idx;  key.vs_hash = vs_hash;
+    key.gen = s_d3d.vp_gen; key.blend = blend;    key.nrt = nrt;
+    key.rtfmt = (u32)rtfmt; key.ctrl = ctrl;      key.ucode_hash = uhash;
+    key.cmask = cmask;      key.cull = cull;      key.cube_mask = cube_mask;
+    key.zs = zs;
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
      * misses on ucode_hash" is. */
@@ -2462,7 +2499,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
     u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
     int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
-    if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
+    if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr);
+                  vp_fp_remember(&key, NULL); return NULL; }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -2666,6 +2704,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
                    e ? (const char*)e->lpVtbl->GetBufferPointer(e) : "?");
         if (e) e->lpVtbl->Release(e);
+        vp_fp_remember(&key, NULL);
         return NULL;
     }
     if (e) e->lpVtbl->Release(e);
@@ -2771,32 +2810,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pb->lpVtbl->Release(pb);
     if (FAILED(hr)) {
         static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
+        vp_fp_remember(&key, NULL);
         return NULL;
     }
     { static int _ok=0; if (PS3_LOG_FIRST(_ok, 32)) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
     rdoc_name((ID3D12Object*)pso, "pso fp 0x%08X ucode %08X vs %d", fp_addr, uhash, vs_idx);
 
-    /* insert (evict oldest when full) */
-    if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
-        if (s_d3d.vp_fp[0].pso) s_d3d.vp_fp[0].pso->lpVtbl->Release(s_d3d.vp_fp[0].pso);
-        memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
-        s_d3d.vp_fp_n = VP_FP_CACHE - 1;
-    }
-    s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].vs_idx  = vs_idx;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].vs_hash = vs_hash;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].gen     = s_d3d.vp_gen;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].blend   = blend;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].nrt     = nrt;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].rtfmt   = (u32)rtfmt;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].ctrl    = ctrl;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].ucode_hash = uhash;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].cull    = cull;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
-    s_d3d.vp_fp_n++;
+    vp_fp_remember(&key, pso);
     return pso;
 }
 
