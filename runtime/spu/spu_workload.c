@@ -1074,24 +1074,31 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
         fflush(stderr);
     }
     /* SPU_JOBPROF=<secs>: host time spent per job image, printed every <secs>.
-     * Jobs run synchronously on the pushing thread, so this is frame time. */
+     * Jobs run on the threads that walk a chain or a queue, and with
+     * SPURS_JC_WORKERS on a chain's job runners too, so the totals add up the
+     * time of jobs that ran at once (more than <secs> when they overlap). The
+     * counters are atomic, and one thread prints and resets them. */
     static int s_prof = -1;
     if (s_prof < 0) { const char* e = getenv("SPU_JOBPROF"); s_prof = e ? atoi(e) : 0; }
     struct timespec t0, t1;
     if (s_prof) timespec_get(&t0, TIME_UTC);
     int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
     if (s_prof) {
-        static double acc[64], last; static unsigned cnt[64];
+        static uint64_t acc_ns[64], last_ns; static unsigned cnt[64];
         timespec_get(&t1, TIME_UTC);
-        double now = t1.tv_sec + t1.tv_nsec * 1e-9;
-        unsigned k = (unsigned)image_id & 63;
-        acc[k] += now - (t0.tv_sec + t0.tv_nsec * 1e-9); cnt[k]++;
-        if (now - last >= s_prof) {
-            last = now;
-            for (unsigned i = 0; i < 64; i++) if (cnt[i]) {
-                fprintf(stderr, "[jobprof] image=%u n=%u total=%.2fs avg=%.2fms\n",
-                        i, cnt[i], acc[i], acc[i] * 1e3 / cnt[i]);
-                acc[i] = 0; cnt[i] = 0;
+        const uint64_t beg = (uint64_t)t0.tv_sec * 1000000000ull + (uint64_t)t0.tv_nsec;
+        const uint64_t now = (uint64_t)t1.tv_sec * 1000000000ull + (uint64_t)t1.tv_nsec;
+        const unsigned k = (unsigned)image_id & 63;
+        __atomic_fetch_add(&acc_ns[k], now - beg, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&cnt[k], 1u, __ATOMIC_RELAXED);
+        uint64_t last = __atomic_load_n(&last_ns, __ATOMIC_RELAXED);
+        if (now - last >= (uint64_t)s_prof * 1000000000ull &&
+            __atomic_compare_exchange_n(&last_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            for (unsigned i = 0; i < 64; i++) {
+                const unsigned n = __atomic_exchange_n(&cnt[i], 0u, __ATOMIC_RELAXED);
+                const uint64_t ns = __atomic_exchange_n(&acc_ns[i], (uint64_t)0, __ATOMIC_RELAXED);
+                if (n) fprintf(stderr, "[jobprof] image=%u n=%u total=%.2fs avg=%.2fms\n",
+                               i, n, (double)ns * 1e-9, (double)ns * 1e-6 / n);
             }
         }
     }
