@@ -693,6 +693,29 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* PAD_NO_HOST=1: leave the computer's own game controllers alone. No XInput
+ * slot or SDL controller is opened, read or rumbled, so every port but 0
+ * reads unplugged, and port 0 is the virtual pad alone: the keyboard fallback
+ * while a window of this process has focus, plus PAD_SCRIPT, PAD_FILE,
+ * PAD_STICK and PAD_AUTOPRESS.
+ *
+ * It is for scripted runs on a machine whose controllers are in use. XInput
+ * reports a pad whichever window has focus, and the SDL backend asks for
+ * background events, so a run left going behind other windows takes that
+ * pad's buttons as the title's input. The scripted presses then land on
+ * other screens than the script was written for, and cellPadSetActDirect
+ * drives the motors of a pad someone is holding for something else. */
+static int s_pad_no_host = -1;   /* the switch, read once */
+static int pad_no_host(void)
+{
+    if (s_pad_no_host < 0) {
+        s_pad_no_host = getenv("PAD_NO_HOST") ? 1 : 0;
+        if (s_pad_no_host)
+            printf("[cellPad] PAD_NO_HOST: host controllers are not opened, read or rumbled\n");
+    }
+    return s_pad_no_host;
+}
+
 static void pad_poll_backend(void)
 {
     static unsigned long long s_last_ms = 0;
@@ -705,11 +728,13 @@ static void pad_poll_backend(void)
      * every port. cellPadGetData hands each one out exactly once. */
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
+    if (!pad_no_host()) {
 #if PAD_BACKEND_XINPUT
-    pad_poll_xinput();
+        pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
-    pad_poll_sdl2();
+        pad_poll_sdl2();
 #endif
+    }
 #ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
@@ -742,7 +767,7 @@ s32 cellPadInit(u32 max_connect)
         pad_host_release(&s_host_state[i]);
 
     pad_lock();
-    pad_init_backend();
+    if (!pad_no_host()) pad_init_backend();
     pad_unlock();
 
     /* Do an initial poll to detect connected controllers */
@@ -1403,6 +1428,9 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
                       param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE], &lo, &hi);
     s_rumble[port_no].lo = lo;
     s_rumble[port_no].hi = hi;
+
+    /* PAD_NO_HOST: the request is kept, but no host motor is touched. */
+    if (pad_no_host()) return CELL_OK;
 
 #if PAD_BACKEND_XINPUT
     /* XInput keeps the motors at what they were last set to: no renewal. */

@@ -200,6 +200,13 @@ jobs:
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
           /tmp/test_pad_hotplug
 
+      # PAD_NO_HOST=1: the host's controllers are not opened, read or
+      # rumbled, and port 0 stays the virtual pad (fake SDL with two pads).
+      - name: Run the pad no-host test
+        run: |
+          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_no_host libs/input/tests/test_pad_no_host.c $(sdl2-config --libs)
+          /tmp/test_pad_no_host
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge

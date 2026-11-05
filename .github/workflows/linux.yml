@@ -225,6 +225,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -lm
           /tmp/test_pad_hotplug
 
+      # PAD_NO_HOST=1: the host's controllers are not opened, read or
+      # rumbled, and port 0 stays the virtual pad (fake SDL with two pads).
+      - name: Run the pad no-host test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_no_host libs/input/tests/test_pad_no_host.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_no_host
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
