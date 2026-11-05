@@ -2086,6 +2086,19 @@ static int vp_get_vs(const rsx_state* st)
                    fclose(f); }
           fprintf(stderr, "[DUCKVP] wrote duck_vp.hlsl (%d instrs)%c", ni, 10);
       } }
+    /* VP_PICK=<hash>[,...]: write each listed vertex program to
+     * vp_pick_<hash>.hlsl when it is compiled. The hash is the one the
+     * capture manifest prints as vsh=, the same in every frame; RSX_DBG_VP
+     * names a program only by the texture on unit 0, which several programs
+     * can share. */
+    { u32 want[8]; const int nw = cap_parse_list(getenv("VP_PICK"), want, 8);
+      for (int k = 0; k < nw; k++) if (want[k] == hash) {
+          char fn[48]; snprintf(fn, sizeof fn, "vp_pick_%08X.hlsl", hash);
+          FILE* f = fopen(fn, "w");
+          if (f) { fprintf(f, "/* vsh %08X, %d instrs */%s", hash, ni, hlsl); fclose(f); }
+          fprintf(stderr, "[VPPICK] wrote %s (%d instrs)%c", fn, ni, 10);
+          break;
+      } }
     /* VP_BYPASS=1: replace the guest transform with a direct map of attribute 0
      * into clip space. If geometry appears with this on, everything from the
      * input layout through raster/depth/present is sound and the fault is the
@@ -2780,11 +2793,28 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(f, " */\n%s\n", hlsl); fclose(f);
         } } }
 
-    /* FP_PICK=<hex fp_addr or ucode hash>: write just that program, whatever
-     * order it compiles in. fp_dump.hlsl keeps only the first four, same trap
-     * as vp2_dump.hlsl. */
-    { static int done = 0;
-      if (!done && fp_dbg_named("FP_PICK", fp_addr, uhash)) { done = 1;
+    /* FP_PICK=<hex fp_addr or ucode hash>[,...]: write just those programs,
+     * whatever order they compile in. fp_dump.hlsl keeps only the first four,
+     * same trap as vp2_dump.hlsl. Each listed program goes to
+     * fp_pick_<ucode hash>.hlsl (the hash the capture manifest prints as
+     * fph=, the same in every frame), once; the first one also to
+     * duck_fp.hlsl, as before. */
+    { static int done = 0; static u32 written[8]; static int nwritten = 0;
+      u32 want[8]; const int nw = cap_parse_list(getenv("FP_PICK"), want, 8);
+      int listed = 0, seen = 0;
+      for (int k = 0; k < nw; k++) if (want[k] == fp_addr || want[k] == uhash) listed = 1;
+      for (int k = 0; k < nwritten; k++) if (written[k] == uhash) seen = 1;
+      if (listed && !seen && nwritten < 8) {
+          written[nwritten++] = uhash;
+          char fn[48]; snprintf(fn, sizeof fn, "fp_pick_%08X.hlsl", uhash);
+          FILE* f = fopen(fn, "w");
+          if (f) { fprintf(f, "/* fp_addr=0x%08X ucode %08X, %d instrs, %u constants */%s",
+                           fp_addr, uhash, n, nconst, hlsl);
+                   fclose(f); }
+          fprintf(stderr, "[FPPICK] wrote %s (fp=0x%08X, %d instrs, %u constants)%c",
+                  fn, fp_addr, n, nconst, 10);
+      }
+      if (listed && !done) { done = 1;
           FILE* f = fopen("duck_fp.hlsl", "w");
           if (f) { fprintf(f, "/* fp_addr=0x%08X ucode %08X, %d instrs */%s", fp_addr, uhash, n, hlsl);
                    fclose(f); }
