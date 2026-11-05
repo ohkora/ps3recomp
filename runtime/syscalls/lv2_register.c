@@ -1647,6 +1647,81 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
     return (int64_t)(int32_t)result;
 }
 
+/* Print the NUL-terminated text at local store `lsa`, if that is what is there:
+ * 3 to 160 printable characters (newline and tab shown escaped). Anything else
+ * prints nothing. Returns 1 when it printed. */
+static int spu_evt_note_text(const uint8_t* ls, uint32_t lsa, const char* what)
+{
+    char out[2 * 160 + 1];
+    int o = 0;
+    for (uint32_t a = lsa, n = 0; a < SPU_LS_SIZE && n < 160; a++, n++) {
+        const uint8_t c = ls[a];
+        if (c == 0) {
+            if (n < 3) return 0;
+            out[o] = 0;
+            fprintf(stderr, "[spu-evt]   text at LS 0x%05X (%s): \"%s\"\n", lsa, what, out);
+            return 1;
+        }
+        if (c == '\n' || c == '\t')     { out[o++] = '\\'; out[o++] = c == '\n' ? 'n' : 't'; }
+        else if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c >= 0x20 && c < 0x7F) out[o++] = (char)c;
+        else return 0;
+    }
+    return 0;
+}
+
+/* What a dropped SPURS user event carried.
+ *
+ * A user event is two words: the interrupt-mailbox word (port and data0) and
+ * the out-mailbox word written just before it (data1). SDK helpers that talk
+ * to a PPU server, spu_printf among them, put a local store address in data1
+ * and leave the payload there for the server to read. The drop line printed
+ * the interrupt word alone, which names the port but not what was said.
+ *
+ * So also print data1, the caller ($0), $3-$6, the eight words at LS[data1],
+ * and any text that data1, those words or $3-$5 point at. Read-only: nothing
+ * the SPU sees changes. */
+static void spu_evt_note_drop(const spu_context* spu)
+{
+    const spu_channel* ob = &spu->ch_out_mbox;
+    const uint32_t queued = ob->count;
+    /* This event's word is the NEWEST one: a dropped event never consumes its
+     * word, so the words of earlier drops can still be queued in front of it. */
+    const uint32_t data1 = queued ? ob->q[(ob->head + queued - 1u) % SPU_CHANNEL_CAP] : 0u;
+    fprintf(stderr, "[spu-evt]   data1=0x%08X%s (out-mbox words queued: %u) lr=0x%05X "
+                    "r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
+            data1, queued ? "" : " (none written)", queued, spu->gpr[0]._u32[0] & SPU_LS_MASK,
+            spu->gpr[3]._u32[0], spu->gpr[4]._u32[0], spu->gpr[5]._u32[0], spu->gpr[6]._u32[0]);
+    const uint8_t* ls = spu->ls;
+    if (!ls) return;
+    uint32_t seen[9];
+    int nseen = 0;
+    if (queued && data1 < SPU_LS_SIZE) {
+        uint32_t base = data1 & ~3u, w[8];
+        if (base > SPU_LS_SIZE - sizeof w) base = SPU_LS_SIZE - sizeof w;
+        for (int i = 0; i < 8; i++) {
+            const uint8_t* p = ls + base + 4u * i;
+            w[i] = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+        }
+        fprintf(stderr, "[spu-evt]   LS[0x%05X]: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        if (spu_evt_note_text(ls, data1, "data1")) seen[nseen++] = data1;
+        for (int i = 0; i < 8; i++) {
+            char what[16];
+            snprintf(what, sizeof what, "word %d", i);
+            if (w[i] && w[i] < SPU_LS_SIZE && spu_evt_note_text(ls, w[i], what)) seen[nseen++] = w[i];
+        }
+    }
+    for (int r = 3; r <= 5; r++) {
+        const uint32_t a = spu->gpr[r]._u32[0];
+        int dup = 0;
+        for (int i = 0; i < nseen; i++) dup |= seen[i] == a;
+        char what[8];
+        snprintf(what, sizeof what, "$r%d", r);
+        if (!dup && a && a < SPU_LS_SIZE) spu_evt_note_text(ls, a, what);
+    }
+}
+
 /* The interrupt mailbox encodes send_event (0..63) or throw_event (64..127).
  * The preceding ordinary mailbox word is data, not a separate PPU event. */
 static int spu_deliver_user_event(spu_context* spu, uint32_t value)
@@ -1656,9 +1731,10 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
     extern uint32_t spurs_port_queue(uint32_t port);
     if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
-        if (code < 128) { static int n; if (PS3_LOG_FIRST(n, 16))
+        if (code < 128) { static int n; if (PS3_LOG_FIRST(n, 16)) {
             fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
-                    code & 63, spu->image_id, value); }
+                    code & 63, spu->image_id, value);
+            spu_evt_note_drop(spu); } }
         return 0;
     }
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.

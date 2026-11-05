@@ -6,10 +6,15 @@
  * bound yet has to wait for the binding for a while instead of being answered with ENOTCONN at once, which makes
  * the SPU program fail its first request. A binding made with sys_spu_thread_connect_event has to be found as well.
  *
+ * SPU code under SPURS (no lv2 group) whose port nothing bound is dropped, and the drop line says what the event
+ * carried: data1, the caller, and the text its payload points at in local store.
+ *
  * clang -std=gnu17 -I include -I runtime -I runtime/syscalls -I runtime/spu -I libs/video
  *   runtime/spu/tests/test_spu_user_event_port.c -Wl,-dead_strip -pthread -o /tmp/test_spu_user_event_port
  *   && /tmp/test_spu_user_event_port
+ * (Linux: -ffunction-sections -fdata-sections -Wl,--gc-sections in place of -Wl,-dead_strip.)
  */
+#include <stdint.h>
 /* Syscall 14's classifier (#341) lives in lv2_lock_line.c, which pulls in the
  * VM map table; nothing here issues syscall 14. */
 int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; return 0; }
@@ -91,6 +96,73 @@ static uint32_t send_event(uint32_t port, double* took_ms)
     return spu_channel_read(&spu.ch_in_mbox);
 }
 
+/* Run fn with stderr captured; returns what it printed (static buffer). */
+static const char* capture_stderr(void (*fn)(void))
+{
+    static char out[8192];
+    fflush(stderr);
+    const int saved = dup(2);
+    FILE* tf = tmpfile();
+    assert(saved >= 0 && tf);
+    dup2(fileno(tf), 2);
+    fn();
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    rewind(tf);
+    const size_t n = fread(out, 1, sizeof out - 1, tf);
+    out[n] = 0;
+    fclose(tf);
+    return out;
+}
+
+static spu_context spurs_spu;
+static uint32_t spurs_ret;
+static void drop_on_unbound_port(void) { spurs_ret = (uint32_t)spu_deliver_user_event(&spurs_spu, 0x01000000u); }
+
+static void ls_put(uint32_t lsa, const void* p, size_t n) { memcpy(spurs_spu.ls_store + lsa, p, n); }
+static void ls_put32(uint32_t lsa, uint32_t v)
+{
+    const uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v };
+    ls_put(lsa, b, 4);
+}
+
+/* An SPURS SPU (no lv2 group) sends on a port nothing bound: the event is still dropped as before, but the
+ * drop line now says what it carried -- data1 (the newest out-mailbox word), the caller, and the text that
+ * data1's words and the argument registers point at in local store. */
+static void spurs_drop_note(void)
+{
+    memset(&spurs_spu, 0, sizeof spurs_spu);
+    spurs_spu.ls = spurs_spu.ls_store;
+    spurs_spu.image_id = 3;
+    ls_put(0x1000, "inflate: bad block %d\n", 23);   /* a format string, newline included */
+    ls_put32(0x2000, 0x1000);                         /* the payload: format pointer, then an argument */
+    ls_put32(0x2004, 7);
+    const uint8_t bin[8] = { 0x41, 0x42, 0x43, 0x01, 0x02, 0, 0, 0 };
+    ls_put(0x3000, bin, sizeof bin);                  /* "ABC" then a control byte: not text */
+    spurs_spu.gpr[0]._u32[0] = 0x0F7C0;
+    spurs_spu.gpr[3]._u32[0] = 0x1000;                /* same text as word 0: printed once */
+    spurs_spu.gpr[4]._u32[0] = 0x3000;
+    spurs_spu.gpr[5]._u32[0] = 0x00400000;            /* outside local store */
+    spu_channel_write(&spurs_spu.ch_out_mbox, 0x1111u);   /* an earlier drop's word, never consumed */
+    spu_channel_write(&spurs_spu.ch_out_mbox, 0x2000u);   /* this event's data1 */
+
+    const char* log = capture_stderr(drop_on_unbound_port);
+    CHECK(spurs_ret == 0, "the SPURS drop still answers 0 (not handled), got %u", spurs_ret);
+    CHECK(spurs_spu.ch_in_mbox.count == 0, "the SPURS drop still writes no reply (count %u)", spurs_spu.ch_in_mbox.count);
+    CHECK(spurs_spu.ch_out_mbox.count == 2, "the SPURS drop still leaves the out-mailbox words (count %u)",
+          spurs_spu.ch_out_mbox.count);
+    CHECK(strstr(log, "unbound port 1 dropped (img=3 value=0x01000000)") != NULL, "the drop line: %s", log);
+    CHECK(strstr(log, "data1=0x00002000 (out-mbox words queued: 2) lr=0x0F7C0 r3=0x00001000 r4=0x00003000") != NULL,
+          "data1 is the newest out-mailbox word, with the caller and registers: %s", log);
+    CHECK(strstr(log, "LS[0x02000]: 00001000 00000007 00000000") != NULL, "the words at LS[data1]: %s", log);
+    CHECK(strstr(log, "text at LS 0x01000 (word 0): \"inflate: bad block %d\\n\"") != NULL,
+          "the text word 0 points at, newline escaped: %s", log);
+    const char* first = strstr(log, "text at LS 0x01000");
+    CHECK(first && !strstr(first + 1, "text at LS 0x01000"), "text already shown for a word is not repeated for $r3: %s", log);
+    CHECK(!strstr(log, "LS 0x03000"), "bytes that are not text print nothing: %s", log);
+}
+
 int main(void)
 {
     vm_base = calloc(1, 1u << 20); assert(vm_base);
@@ -134,6 +206,8 @@ int main(void)
     spu.spu_id = 0x7FFFFF;                       /* no such thread: nothing will ever bind its port */
     r = send_event(0x2A, &ms);
     CHECK(r == CELL_ENOTCONN && ms < 50.0, "an SPU with no thread: answer 0x%08X after %.0f ms (no wait)", r, ms);
+
+    spurs_drop_note();
 
     printf("[spu_user_event_port] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);
