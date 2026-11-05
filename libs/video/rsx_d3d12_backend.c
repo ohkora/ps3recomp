@@ -133,6 +133,7 @@ typedef struct {
         int set;
         u32 addr, filter, ctrl0, border;   /* TEXTURE_ADDRESS/FILTER/CONTROL0/BORDER_COLOR */
         u32 dim;        /* SET_TEXTURE_FORMAT bits 4..7: dimension (1, 2 or 3) */
+        u32 pitch;      /* SET_TEXTURE_CONTROL3 [19:0]: a linear texture's row pitch */
     } tex[VP_TEX_UNITS];
     int tex_rt[VP_TEX_UNITS];   /* pre-pass: OffRT index sampled by unit, -1 = none */
     int tex_slot;       /* legacy single-slot path (atlas); -1 = none */
@@ -219,6 +220,7 @@ typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
+    u32 pitch;          /* guest row pitch it was read with (0 = tightly packed) */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
     int cube;           /* resource is a 6-face cube, sampled as TextureCube */
     u32 key;            /* the ORIGINAL bound offset -- the cache lookup key.
@@ -392,7 +394,7 @@ typedef struct {
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t15). */
     struct { u32 off, raw, w, h, fmt, ctrl1, mips; int cube; int set;
-             u32 addr, filter, ctrl0, border, dim; } cur_texs[VP_TEX_UNITS];
+             u32 addr, filter, ctrl0, border, dim, pitch; } cur_texs[VP_TEX_UNITS];
     /* Guest sampler states, one shader-visible descriptor each (samp_key[i]
      * describes descriptor i; 0 and 1 are the defaults for units with none). */
     ID3D12DescriptorHeap* samp_heap;
@@ -3013,7 +3015,8 @@ static DXGI_FORMAT vp_texfmt_dxgi(rsx_texfmt f)
     }
 }
 
-static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
+static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips,
+                              u32 row_pitch)
 {
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
      * tried against the TDR and does not help, because PERF shows the upload
@@ -3036,8 +3039,11 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     /* Format class, row sizes and swizzling are RSX semantics: rsx_texture_
      * layout.c owns them so the Metal backend can read a guest texture without
      * re-deriving any of it. Only the DXGI mapping below is ours. */
+    /* A linear texture's rows sit SET_TEXTURE_CONTROL3's pitch apart, which
+     * can be wider than one row of texels; rsx_texture_layout_pitched ignores
+     * the pitch for swizzled and compressed images, as the hardware does. */
     rsx_tex_layout tl;
-    rsx_texture_layout(fmt, w, h, &tl);
+    rsx_texture_layout_pitched(fmt, w, h, row_pitch, &tl);
     int argb = (tl.fmt == RSX_TEXFMT_R8G8B8A8);
     int dxt  = tl.compressed;
     /* Compressed rows are counted in blocks, so keep bpp at 1 for the byte
@@ -3061,7 +3067,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     for (int i = 0; i < VP_TEX_SLOTS; i++) {
         VPTexSlot* c = &s_d3d.vp_tex[i];
         if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt
-            && c->cube == cube) {
+            && c->cube == cube && c->pitch == row_pitch) {
             c->last_frame = s_d3d.frame_count;
             if (c->used) return i;                /* already bound this frame */
             { static int nocache = -1;            /* TEX_NOCACHE=1: always re-upload */
@@ -3071,7 +3077,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             /* Held from an earlier frame: re-upload only if the guest bytes
              * changed. Most of this scene's textures are static, and converting
              * every one of them every frame was ~70% of the frame's CPU time. */
-            u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
+            u32 nb = tl.face_bytes;   /* the bytes the decode reads */
             u32 cs = TEX_CSUM(vm_base + c->off, nb);
             if (cs == c->csum) { c->used = 1; return i; }
             slot = i; break;                      /* stale: fall through and redo */
@@ -3610,8 +3616,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }
 
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
-    t->cube = cube; t->used = 1;
-    { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
+    t->pitch = row_pitch; t->cube = cube; t->used = 1;
+    { u32 nb = tl.face_bytes;
       t->csum = TEX_CSUM(vm_base + off, nb); }
     #undef TEX_CSUM
     return slot;
@@ -4417,7 +4423,7 @@ static int screen_copy_stands_in(const D3D12DrawRecord* dr, int u, int mode)
     /* About a thousand words spread over the whole image: a backdrop can
      * start with rows of black. */
     rsx_tex_layout tl;
-    rsx_texture_layout(dr->tex[u].fmt, dr->tex[u].w, dr->tex[u].h, &tl);
+    rsx_texture_layout_pitched(dr->tex[u].fmt, dr->tex[u].w, dr->tex[u].h, dr->tex[u].pitch, &tl);
     const u32 span = tl.face_bytes;
     const u32 step = span > 4096u ? (span / 1024u) & ~3u : 4u;
     for (u32 i = 0; i + 4u <= span; i += step) {
@@ -5096,7 +5102,7 @@ static void render_frame(void)
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt,
-                                                _cube, dr->tex[_u].mips);
+                                                _cube, dr->tex[_u].mips, dr->tex[_u].pitch);
                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
                     /* Both forms of the offset are in hand here; the filters
@@ -7309,7 +7315,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim; dr->tex[_u].pitch = s_d3d.cur_texs[_u].pitch;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                     dr->tex_rt[_u]  = -1;
                 }
@@ -7430,7 +7436,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim; dr->tex[_u].pitch = s_d3d.cur_texs[_u].pitch;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                 dr->tex_rt[_u]  = -1;
             }
@@ -7597,7 +7603,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border; dr->tex[_u].dim = s_d3d.cur_texs[_u].dim; dr->tex[_u].pitch = s_d3d.cur_texs[_u].pitch;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
             dr->tex_rt[_u]  = -1;
         }
@@ -7753,6 +7759,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].ctrl0  = tex->control0;
         s_d3d.cur_texs[unit].border = tex->border_color;
         s_d3d.cur_texs[unit].dim    = (tex->format >> 4) & 15u;
+        s_d3d.cur_texs[unit].pitch  = tex->control3 & 0xFFFFFu;
         /* A format byte rsx_texture_layout has no class for decodes as one
          * byte per texel, its fallback. Name each such byte once. */
         if (!tex_fmt_is_depth(format) && base_fmt != 0x81u) {
