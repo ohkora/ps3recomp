@@ -261,6 +261,261 @@ static DIR* fd_dir(int fd)
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
 }
 
+/* ---- PS3_FS_RING: the transfers behind a guest buffer ----------------------
+ *
+ * PS3_FS_RING=<n> remembers the last n file operations: cellFsRead,
+ * cellFsWrite, cellFsAioRead and cellFsLseek (n is rounded up to a power of
+ * two, 16 to 65536). Each entry holds the guest thread, the fd and its host
+ * file, the file position and the size asked for and done, the guest buffer,
+ * when the call started and ended, and the FNV-1a 64 hash of the bytes moved.
+ * Nothing is printed until a probe asks:
+ *
+ *   ppu_fs_ring_report(ea, size, why) prints every remembered transfer that
+ *   touched [ea, ea + size), oldest first, each with two checks made then:
+ *     now=  the hash of that transfer's guest bytes now: "same", or "CHANGED"
+ *           when something has written the buffer since;
+ *     file= the hash of the same bytes of the host file, read again now:
+ *           "same", or "DIFFERS" when the file holds other bytes there (it has
+ *           been written since, or the read came from somewhere else);
+ *   and every later write to that part of the file. No entry at all means no
+ *   remembered transfer touched the range.
+ *
+ *   ppu_fs_ring_write(path) writes every entry to a text file, for a script
+ *   to match against.
+ *
+ * It also checks the one thing a guest thread can't see go wrong: two threads
+ * moving one fd's position. After a thread's cellFsLseek, its next read or
+ * write on that fd must start where the seek left it. If another thread's
+ * call moved the position in between, the transfer reads or writes the wrong
+ * part of the file. On lv2 that only happens when the guest's own lock around
+ * the pair fails, so each one is logged ("[fsring] RACE", the first 16 lines).
+ *
+ * Written to tell apart the ways a decompressor's input ends up wrong: a read
+ * that brought the wrong bytes, a buffer written over after its read, or a
+ * buffer that no read filled. Off by default. When on, each transfer also
+ * costs one pass over its bytes and a lock. */
+#include <string>
+#include <vector>
+#include <chrono>
+#ifdef _WIN32
+#  define FS_LOCKFILE(f)   _lock_file(f)     /* the stream's own (recursive) lock */
+#  define FS_UNLOCKFILE(f) _unlock_file(f)
+#else
+#  define FS_LOCKFILE(f)   flockfile(f)
+#  define FS_UNLOCKFILE(f) funlockfile(f)
+#endif
+
+struct FsRingEnt {
+    uint64_t seq;          /* 1, 2, ...; 0 = empty */
+    uint64_t t0, t1;       /* microseconds since the ring was armed */
+    uint64_t pos;          /* file position the call started at (seek: where it left it) */
+    uint64_t hash;         /* FNV-1a 64 of the bytes moved */
+    uint32_t buf, want, got;
+    uint32_t tid;          /* guest thread */
+    int32_t  fd;
+    uint16_t path;         /* 1 + index into s_ring_paths; 0 = not known */
+    char     op;           /* 'R' read, 'W' write, 'A' aio read, 'S' seek */
+};
+#define FS_RING_TIDS 65    /* guest thread ids 1..64 (PPU_THREAD_MAX); [0] for any other */
+static std::mutex s_ring_lock;
+static FsRingEnt* s_ring;
+static uint32_t   s_ring_mask;
+static uint64_t   s_ring_seq;
+static std::vector<std::string> s_ring_paths;
+static std::chrono::steady_clock::time_point s_ring_t0;
+static uint16_t   g_fd_ring_path[FS_MAX];
+static uint32_t   g_fd_ring_last_tid[FS_MAX];
+/* Per fd and guest thread: 1 + where that thread's last cellFsLseek left the
+ * fd, until its next transfer on it; 0 when none is pending. */
+static uint64_t   g_fd_ring_seek[FS_MAX][FS_RING_TIDS];
+static std::atomic<uint32_t> s_ring_races{0};
+
+static bool fs_ring_init()
+{
+    const char* e = getenv("PS3_FS_RING");
+    long n = e ? strtol(e, nullptr, 0) : 0;
+    if (n <= 0) return false;
+    uint32_t cap = 16;
+    while (cap < (uint32_t)n && cap < 65536u) cap <<= 1;
+    s_ring = (FsRingEnt*)calloc(cap, sizeof(FsRingEnt));
+    if (!s_ring) return false;
+    s_ring_mask = cap - 1;
+    s_ring_t0 = std::chrono::steady_clock::now();
+    fprintf(stderr, "[fsring] PS3_FS_RING=%u: remembering the last %u file operations\n", cap, cap);
+    return true;
+}
+static bool fs_ring_on()
+{
+    static const bool on = fs_ring_init();   /* thread-safe one-time init */
+    return on;
+}
+static uint64_t fs_ring_now_us()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - s_ring_t0).count();
+}
+static uint64_t fs_ring_hash(const uint8_t* p, uint64_t n)
+{
+    uint64_t h = 0xCBF29CE484222325ull;      /* FNV-1a 64 */
+    for (uint64_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001B3ull; }
+    return h;
+}
+static inline uint32_t fs_ring_tid_slot(uint32_t tid) { return tid < FS_RING_TIDS ? tid : 0; }
+
+/* A file was opened on fd: remember its host path for the file= check. */
+static void fs_ring_note_open(int fd, const char* hpath)
+{
+    if (!fs_ring_on() || fd < 0 || fd >= FS_MAX) return;
+    uint16_t id = 0;
+    if (hpath) {
+        std::lock_guard<std::mutex> hold(s_ring_lock);
+        size_t i = 0;
+        for (; i < s_ring_paths.size(); i++) if (s_ring_paths[i] == hpath) break;
+        if (i == s_ring_paths.size() && i < 65535) s_ring_paths.push_back(hpath);
+        if (i < s_ring_paths.size()) id = (uint16_t)(i + 1);
+    }
+    __atomic_store_n(&g_fd_ring_path[fd], id, __ATOMIC_RELAXED);
+    for (int t = 0; t < FS_RING_TIDS; t++) __atomic_store_n(&g_fd_ring_seek[fd][t], 0ull, __ATOMIC_RELAXED);
+}
+
+static const char* fs_ring_path_name(uint16_t id)   /* caller holds s_ring_lock */
+{
+    return id && id <= s_ring_paths.size() ? s_ring_paths[id - 1].c_str() : "?";
+}
+
+/* A transfer on fd is about to start at pos: check it against the thread's own
+ * last seek, then note who used the fd last. */
+static void fs_ring_check_pos(int fd, uint32_t tid, uint64_t pos, char op)
+{
+    if (fd < 0 || fd >= FS_MAX) return;
+    const uint32_t ti = fs_ring_tid_slot(tid);
+    const uint64_t want = __atomic_exchange_n(&g_fd_ring_seek[fd][ti], 0ull, __ATOMIC_RELAXED);
+    const uint32_t last = __atomic_exchange_n(&g_fd_ring_last_tid[fd], tid, __ATOMIC_RELAXED);
+    if (!want || want - 1 == pos) return;
+    const uint32_t n = ++s_ring_races;
+    if (n <= 16) {
+        std::lock_guard<std::mutex> hold(s_ring_lock);
+        fprintf(stderr, "[fsring] RACE fd=%d '%s': thread %u's lseek left the position at 0x%llX, "
+                        "but its %s starts at 0x%llX (the fd was last used by thread %u)\n",
+                fd, fs_ring_path_name(__atomic_load_n(&g_fd_ring_path[fd], __ATOMIC_RELAXED)),
+                tid, (unsigned long long)(want - 1), op == 'W' ? "write" : "read",
+                (unsigned long long)pos, last);
+    }
+}
+
+static void fs_ring_add(char op, int fd, uint32_t tid, uint64_t pos, uint32_t buf,
+                        uint64_t want, uint64_t got, uint64_t t0, uint64_t hash)
+{
+    const uint64_t t1 = fs_ring_now_us();
+    const uint16_t path = (fd >= 0 && fd < FS_MAX) ? __atomic_load_n(&g_fd_ring_path[fd], __ATOMIC_RELAXED) : 0;
+    std::lock_guard<std::mutex> hold(s_ring_lock);
+    FsRingEnt& e = s_ring[s_ring_seq & s_ring_mask];
+    e.seq = ++s_ring_seq;
+    e.t0 = t0; e.t1 = t1; e.pos = pos; e.hash = hash;
+    e.buf = buf; e.want = (uint32_t)want; e.got = (uint32_t)got;
+    e.tid = tid; e.fd = fd; e.path = path; e.op = op;
+}
+
+/* The hash of a host file's bytes [pos, pos + n), read through a fresh stream.
+ * Returns the number of bytes it could read. */
+static uint64_t fs_ring_file_hash(const char* path, uint64_t pos, uint64_t n, uint64_t* hash)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    uint8_t* tmp = (uint8_t*)malloc(n ? (size_t)n : 1);
+    uint64_t got = 0;
+    if (tmp && FS_SEEK64(f, pos, SEEK_SET) == 0) got = fread(tmp, 1, (size_t)n, f);
+    if (tmp) *hash = fs_ring_hash(tmp, got);
+    free(tmp);
+    fclose(f);
+    return got;
+}
+
+static const char* fs_ring_op_name(char op)
+{
+    return op == 'R' ? "read" : op == 'W' ? "write" : op == 'A' ? "aio read" : "lseek";
+}
+
+extern "C" void ppu_fs_ring_report(uint32_t ea, uint32_t size, const char* why)
+{
+    if (!why) why = "report";
+    if (!fs_ring_on()) {
+        fprintf(stderr, "[fsring] %s: PS3_FS_RING is not set, nothing was remembered\n", why);
+        return;
+    }
+    const uint64_t now = fs_ring_now_us();
+    std::vector<FsRingEnt> hit, writes;
+    std::vector<std::string> names;
+    uint64_t first = 0, last = 0, oldest_t = now;
+    {
+        std::lock_guard<std::mutex> hold(s_ring_lock);
+        const uint64_t n = s_ring_seq < (uint64_t)s_ring_mask + 1 ? s_ring_seq : (uint64_t)s_ring_mask + 1;
+        first = s_ring_seq - n + 1; last = s_ring_seq;
+        for (uint64_t s = first; n && s <= last; s++) {
+            const FsRingEnt& e = s_ring[(s - 1) & s_ring_mask];
+            if (e.seq != s) continue;
+            if (s == first) oldest_t = e.t0;
+            if (e.op == 'W') writes.push_back(e);
+            if (e.op == 'S' || !e.got) continue;
+            if ((uint64_t)e.buf < (uint64_t)ea + size && (uint64_t)ea < (uint64_t)e.buf + e.got) hit.push_back(e);
+        }
+        names = s_ring_paths;
+    }
+    fprintf(stderr, "[fsring] %s: 0x%08X-0x%08X, %zu of the remembered transfers touch it "
+                    "(ring #%llu-#%llu, the oldest %.1f ms ago, %u races seen)\n",
+            why, ea, ea + size, hit.size(), (unsigned long long)first, (unsigned long long)last,
+            (double)(now - oldest_t) / 1000.0, s_ring_races.load());
+    for (const FsRingEnt& e : hit) {
+        const char* path = e.path && e.path <= names.size() ? names[e.path - 1].c_str() : nullptr;
+        const uint64_t hnow = (ppu_vm_size && (uint64_t)e.buf + e.got > ppu_vm_size) ? 0
+                            : fs_ring_hash(vm_base + e.buf, e.got);
+        char file[96] = "file=? (no host path)";
+        if (path) {
+            uint64_t hf = 0;
+            const uint64_t k = fs_ring_file_hash(path, e.pos, e.got, &hf);
+            if (k != e.got) snprintf(file, sizeof file, "file=short (%llu of %u bytes there now)",
+                                     (unsigned long long)k, e.got);
+            else snprintf(file, sizeof file, "file=%s", hf == e.hash ? "same" : "DIFFERS");
+        }
+        fprintf(stderr, "[fsring]   #%llu %s thread %u fd=%d '%s' pos=0x%llX want=%u got=%u "
+                        "buf=0x%08X-0x%08X %.1f ms ago, took %llu us, hash=%016llX now=%s %s\n",
+                (unsigned long long)e.seq, fs_ring_op_name(e.op), e.tid, e.fd, path ? path : "?",
+                (unsigned long long)e.pos, e.want, e.got, e.buf, e.buf + e.got,
+                (double)(now - e.t0) / 1000.0, (unsigned long long)(e.t1 - e.t0),
+                (unsigned long long)e.hash, hnow == e.hash ? "same" : "CHANGED", file);
+        for (const FsRingEnt& w : writes)
+            if (w.seq > e.seq && w.path && w.path == e.path &&
+                w.pos < e.pos + e.got && e.pos < w.pos + w.got)
+                fprintf(stderr, "[fsring]     later write #%llu thread %u fd=%d pos=0x%llX got=%u, %.1f ms ago\n",
+                        (unsigned long long)w.seq, w.tid, w.fd, (unsigned long long)w.pos, w.got,
+                        (double)(now - w.t0) / 1000.0);
+    }
+}
+
+extern "C" long ppu_fs_ring_write(const char* host_path)
+{
+    if (!fs_ring_on() || !host_path) return -1;
+    FILE* out = fopen(host_path, "w");
+    if (!out) return -1;
+    long n = 0;
+    std::lock_guard<std::mutex> hold(s_ring_lock);
+    fprintf(out, "# PS3_FS_RING: seq op tid fd path pos want got buf t0_us t1_us fnv1a64\n");
+    for (size_t i = 0; i < s_ring_paths.size(); i++)
+        fprintf(out, "# path %zu %s\n", i + 1, s_ring_paths[i].c_str());
+    const uint64_t k = s_ring_seq < (uint64_t)s_ring_mask + 1 ? s_ring_seq : (uint64_t)s_ring_mask + 1;
+    for (uint64_t s = s_ring_seq - k + 1; k && s <= s_ring_seq; s++) {
+        const FsRingEnt& e = s_ring[(s - 1) & s_ring_mask];
+        if (e.seq != s) continue;
+        fprintf(out, "%llu %c %u %d %u 0x%llX %u %u 0x%08X %llu %llu %016llX\n",
+                (unsigned long long)e.seq, e.op, e.tid, e.fd, e.path, (unsigned long long)e.pos,
+                e.want, e.got, e.buf, (unsigned long long)e.t0, (unsigned long long)e.t1,
+                (unsigned long long)e.hash);
+        n++;
+    }
+    fclose(out);
+    return n;
+}
+
 /* ---- handlers ---- */
 static void cellFsOpen(ppu_context* ctx)
 {
@@ -318,6 +573,7 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    fs_ring_note_open(fd, hpath);
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
@@ -416,6 +672,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         rewind(tf);
         int fd = fd_alloc_file(tf);
         if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+        fs_ring_note_open(fd, nullptr);   /* an anonymous file: no file= check */
         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
         fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
                 gpath, fd, dec_sz,
@@ -426,6 +683,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    fs_ring_note_open(fd, hpath);
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
             magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
@@ -485,8 +743,22 @@ static void cellFsRead(ppu_context* ctx)
     long fpos_before = ftell(f);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
+    /* PS3_FS_RING: the position and the read under the stream's lock, so the
+     * entry says exactly where this read started. */
+    const bool ring = fs_ring_on();
+    uint64_t ring_t0 = 0, ring_pos = 0;
+    if (ring) { FS_LOCKFILE(f); ring_t0 = fs_ring_now_us(); }
     fs_set_dir(fd, f, 1);
+    if (ring) {
+        ring_pos = (uint64_t)FS_TELL64(f);
+        fs_ring_check_pos(fd, (uint32_t)ctx->thread_id, ring_pos, 'R');
+    }
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
+    if (ring) {
+        FS_UNLOCKFILE(f);
+        fs_ring_add('R', fd, (uint32_t)ctx->thread_id, ring_pos, buf, nbytes, n, ring_t0,
+                    fs_ring_hash(vm_base + buf, n));
+    }
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -554,8 +826,20 @@ static void cellFsWrite(ppu_context* ctx)
     FILE* f = fd_file(fd);
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
+    const bool ring = fs_ring_on();   /* PS3_FS_RING: as in cellFsRead */
+    uint64_t ring_t0 = 0, ring_pos = 0;
+    if (ring) { FS_LOCKFILE(f); ring_t0 = fs_ring_now_us(); }
     fs_set_dir(fd, f, 2);
+    if (ring) {
+        ring_pos = (uint64_t)FS_TELL64(f);
+        fs_ring_check_pos(fd, (uint32_t)ctx->thread_id, ring_pos, 'W');
+    }
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+    if (ring) {
+        FS_UNLOCKFILE(f);
+        fs_ring_add('W', fd, (uint32_t)ctx->thread_id, ring_pos, buf, nbytes, n, ring_t0,
+                    fs_ring_hash(vm_base + buf, n));
+    }
     /* Hand the bytes to the host now. Each guest fd is its own stdio stream on
      * its own host descriptor, so whatever fwrite leaves in the stream's buffer
      * (the whole write when it is small, the tail otherwise) is invisible to
@@ -648,8 +932,18 @@ static void cellFsLseek(ppu_context* ctx)
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
+    const bool ring = fs_ring_on();   /* PS3_FS_RING: where THIS seek left the fd */
+    const uint64_t ring_t0 = ring ? fs_ring_now_us() : 0;
+    if (ring) FS_LOCKFILE(f);
     FS_SEEK64(f, off, worigin);
     int64_t p = FS_TELL64(f);
+    if (ring) {
+        FS_UNLOCKFILE(f);
+        const uint32_t tid = (uint32_t)ctx->thread_id;
+        if (p >= 0) __atomic_store_n(&g_fd_ring_seek[fd][fs_ring_tid_slot(tid)], (uint64_t)p + 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_fd_ring_last_tid[fd], tid, __ATOMIC_RELAXED);
+        fs_ring_add('S', fd, tid, (uint64_t)p, 0, wh, 0, ring_t0, 0);
+    }
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -971,6 +1265,7 @@ static void cellFsAioRead(ppu_context* ctx)
          * could land between the two, and the next cellFsRead continued from
          * wherever the AIO stopped. Hold the stream lock across seek, read
          * and the seek back (stdio's own calls take the same lock). */
+        const uint64_t ring_t0 = fs_ring_on() ? fs_ring_now_us() : 0;
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
         if (HOST_FSEEK64(f, offset) == 0)
@@ -978,6 +1273,9 @@ static void cellFsAioRead(ppu_context* ctx)
         if (pos >= 0) HOST_FSEEK64(f, pos);
         HOST_UNLOCKFILE(f);
         err = CELL_OK;
+        if (fs_ring_on())
+            fs_ring_add('A', fd, (uint32_t)ctx->thread_id, offset, buf, size, n, ring_t0,
+                        fs_ring_hash(vm_base + buf, n));
     }
     if (getenv("PS3_FSLOG"))
         fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
