@@ -556,6 +556,16 @@ static void cellFsWrite(ppu_context* ctx)
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     fs_set_dir(fd, f, 2);
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+    /* Hand the bytes to the host now. Each guest fd is its own stdio stream on
+     * its own host descriptor, so whatever fwrite leaves in the stream's buffer
+     * (the whole write when it is small, the tail otherwise) is invisible to
+     * another fd on the same file, and lost if the process is killed before
+     * the next seek or close. On cellFs a returned write is in the file. FIOS
+     * builds an HDD cache this way: one fd fills the data file while others
+     * read it back, and a test run that ends by killing the title leaves the
+     * index pointing at data that never arrived. sys_fs_write and
+     * libs/filesystem/cellFs.c already flush after every write. */
+    if (n) fflush(f);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
