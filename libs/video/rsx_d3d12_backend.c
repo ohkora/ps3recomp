@@ -70,9 +70,13 @@
  * own texScale/offset uniforms, so one per-frame snapshot ran every pass
  * with the LAST pass's constants. */
 #define VP_CB_STRIDE      8448
-/* b1 per-draw FP slot: rsx_texscale[4] + rsx_alphatest + fp_k[64]
- * = 69 float4 = 1104 B, rounded to D3D12's 256-byte CBV alignment. */
-#define VP_FPCB_STRIDE    1280
+/* b1 per-draw FP slot: the PSConstants block rsx_fp_decompile_buffered_ex
+ * declares, i.e. the program's inline constants (fp_constants[]) followed by
+ * fp_alpha. A program is read from at most 4096 bytes, and each inline
+ * constant takes the 16 bytes after its instruction, so a program has at most
+ * 128: 129 float4 = 2064 B, rounded up to D3D12's 256-byte CBV alignment. */
+#define VP_FP_MAX_CONSTS  128
+#define VP_FPCB_STRIDE    2304
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 /* Texture units of the guest-FP path: t0-t15 and s0-s15. The FP decompiler
  * declares rsx_tex[16] and rsx_samp[16], so a program that samples unit N
@@ -268,6 +272,7 @@ typedef struct {
                              * and a 2D variant of the same program are different
                              * pipelines and must not share a cache entry. */
     u64 zs;                 /* depth/stencil state, rsx_zs_key (PSO key) */
+    u32 alpha;              /* alpha-test function compiled in, 0 = none (PSO key) */
     ID3D12PipelineState* pso;
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
@@ -2336,6 +2341,21 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     return m;
 }
 
+/* The alpha test a draw's pipeline compiles in: the CELL_GCM comparison
+ * (0x200 NEVER .. 0x206 GEQUAL), or 0 for none -- the test is off, the
+ * function is ALWAYS, or NO_ALPHATEST=1. D3D12 has no fixed-function alpha
+ * test, so the program discards on it (rsx_fp_apply_alpha_test_buffered) and
+ * the function is part of the pipeline key. The reference is not: the program
+ * reads it from fp_alpha.x, which vp_record_cb fills per draw. */
+static u32 dr_alpha_func(const D3D12DrawRecord* dr)
+{
+    if (!((dr->alpha_ctl >> 16) & 1u)) return 0;
+    const u32 func = 0x200u | ((dr->alpha_ctl >> 8) & 0xFFu);
+    if (func >= 0x207u) return 0;
+    if (env_on("NO_ALPHATEST", &s_env_noalphatest)) return 0;
+    return func;
+}
+
 /* Cache a guest-FP pipeline under its key, or with pso NULL the fact that the
  * key does not build. A program that fails to decompile, to compile or to make
  * a pipeline fails the same way every time its key comes back, and it comes
@@ -2368,7 +2388,7 @@ static void vp_fp_remember(const VPFPEntry* key, ID3D12PipelineState* pso)
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
-                                          u32 cube_mask, u64 zs)
+                                          u32 cube_mask, u64 zs, u32 alpha)
 {
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;   /* 0: a depth-only pass */
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2392,9 +2412,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
     /* Content hash: inline constants are patched in place per frame (wave's
      * stamp), so identity is the BYTES, not the address. */
-    /* Hash the CODE, not the constants: with fp_k[] hoisted into the per-draw
-     * constant buffer the compiled shader is invariant under constant changes,
-     * so hashing them made the pipeline key move every draw. */
+    /* Hash the CODE, not the constants: the program reads its inline constants
+     * from the per-draw constant buffer (fp_constants[] in b1), so the compiled
+     * shader is invariant under constant changes, and hashing them made the
+     * pipeline key move every draw. */
     u32 uhash;
     {
         u32 usz = rsx_fp_program_size(vm_base + off, 4096);
@@ -2414,7 +2435,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
     s_perf_pso_calls++;
     /* Keyed on the code, not on where it lives. The compiled shader reads its
-     * inline constants from the draw's own fp_addr (fp_k[], refilled per draw),
+     * inline constants from the draw's own fp_addr (fp_constants[], refilled per draw),
      * so a program's pipeline is the same wherever the title puts it. God of
      * War HD uploads its fragment programs into a ring every frame: keyed on the
      * address, every draw of every frame missed and went through a full
@@ -2427,7 +2448,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].ctrl == ctrl &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
-            s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].zs == zs)
+            s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].zs == zs &&
+            s_d3d.vp_fp[i].alpha == alpha)
             return s_d3d.vp_fp[i].pso;   /* NULL: this key is known not to build */
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     VPFPEntry key;
@@ -2436,7 +2458,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.gen = s_d3d.vp_gen; key.blend = blend;    key.nrt = nrt;
     key.rtfmt = (u32)rtfmt; key.ctrl = ctrl;      key.ucode_hash = uhash;
     key.cmask = cmask;      key.cull = cull;      key.cube_mask = cube_mask;
-    key.zs = zs;
+    key.zs = zs;            key.alpha = alpha;
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
      * misses on ucode_hash" is. */
@@ -2460,7 +2482,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             VPFPEntry* q = &s_d3d.vp_fp[i];
             if (q->fp_addr != fp_addr) continue;
             n++;
-            fprintf(stderr, "[PSOMISS] fp=0x%X differs:%s%s%s%s%s%s%s%s%c", fp_addr,
+            fprintf(stderr, "[PSOMISS] fp=0x%X differs:%s%s%s%s%s%s%s%s%s%c", fp_addr,
                     q->vs_idx != vs_idx        ? " vs_idx"     : "",
                     q->vs_hash != vs_hash      ? " vs_hash"    : "",
                     q->gen != s_d3d.vp_gen     ? " gen"        : "",
@@ -2468,7 +2490,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                     q->nrt != nrt              ? " nrt"        : "",
                     q->rtfmt != (u32)rtfmt     ? " rtfmt"      : "",
                     q->ucode_hash != uhash     ? " ucode_hash" : "",
-                    q->cube_mask != cube_mask  ? " cube_mask"  : "", 10);
+                    q->cube_mask != cube_mask  ? " cube_mask"  : "",
+                    q->alpha != alpha          ? " alpha"      : "", 10);
             break;
         } } }
     /* CUBEKEYDBG=1: which (program, cube mask) pairs are being compiled. If one
@@ -2498,7 +2521,21 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     static int ctrl_auto = -1;
     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
     u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
-    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
+    /* Buffered: the inline constants are read from fp_constants[] in b1, which
+     * vp_record_cb refills from the draw's own ucode, instead of being baked
+     * into the source as literals. Baked in, they went stale: the pipeline key
+     * hashes the code without its constants, so every later draw of the same
+     * code -- whatever constants the title had patched in since -- ran with the
+     * ones the first draw compiled in. */
+    u32 nconst = 0;
+    int n = rsx_fp_decompile_buffered_ex(vm_base + off, 4096, fp_ctrl, 0u,
+                                         hlsl, sizeof(hlsl), &nconst);
+    if (n > 0 && nconst > VP_FP_MAX_CONSTS) n = -1;   /* would not fit b1 */
+    if (n > 0 && alpha) {
+        if (rsx_fp_apply_alpha_test_buffered(hlsl, sizeof(hlsl), alpha) < 0) n = -1;
+        else { static int _a = 0; if (PS3_LOG_FIRST(_a, 8))
+            printf("[FP] fp=0x%08X compiled with alpha test 0x%03X\n", fp_addr, alpha); }
+    }
     if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr);
                   vp_fp_remember(&key, NULL); return NULL; }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
@@ -3512,64 +3549,50 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
     if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return;
-    /* FP texcoord scale (b1): 1/size for UNnormalized textures (fmt bit
-     * 0x40 -- wave samples everything in texel space), 1.0 otherwise. */
+    /* b1: the PSConstants block of the buffered decompile (vp_get_fp_pso),
+     *     cbuffer PSConstants : register(b1) { float4 fp_constants[max(n,1)];
+     *                                          float4 fp_alpha; };
+     * fp_constants[] are the program's inline constants, read from the draw's
+     * own ucode in the order the decompiler numbers them. Titles patch these
+     * between draws of the same code (per-object material and lighting values,
+     * a sprite's UV rectangle), and the pipeline is shared by every draw of
+     * that code, so they are filled here, per draw, at record time.
+     * fp_alpha.x is the alpha-test reference in the colour target's units
+     * (read by programs compiled with an alpha test only); .y and .z, the RSX
+     * window origin and pixel-centre bias, stay 0, which the decompiler reads
+     * as the host position. */
     if (s_d3d.vp_fpcb_mapped) {
-        float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped
+        u32* cb = (u32*)((char*)s_d3d.vp_fpcb_mapped
             + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE);
-        for (int _u = 0; _u < 4; _u++) {
-            float sx = 1.0f, sy = 1.0f;
-            if (dr && dr->tex[_u].set && (dr->tex[_u].fmt & 0x40) &&
-                dr->tex[_u].w && dr->tex[_u].h) {
-                sx = 1.0f / (float)dr->tex[_u].w;
-                sy = 1.0f / (float)dr->tex[_u].h;
-            }
-            ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = 0.0f; ts[_u*4+3] = 0.0f;
-        }
-        /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
-         * has no fixed alpha test; guest FPs discard on it dynamically
-         * (wave's colour wheel is a disc via alpha test -- without it the
-         * palette drew as an opaque square). */
-        if (dr && !env_on("NO_ALPHATEST", &s_env_noalphatest)) {
-            { static int _at = 0;
-              if (((dr->alpha_ctl >> 16) & 1u) && PS3_LOG_FIRST(_at, 4))
-                  printf("[ALPHATEST] enable func=%u ref=%u\n",
-                         (dr->alpha_ctl >> 8) & 0xFFu, dr->alpha_ctl & 0xFFu); }
-            ts[16] = (float)((dr->alpha_ctl >> 16) & 1u);
-            ts[17] = (float)(dr->alpha_ctl & 0xFFu) / 255.0f;
-            ts[18] = (float)((dr->alpha_ctl >> 8) & 0x07u);
-            ts[19] = 0.0f;
-        } else {
-            ts[16] = 0.0f; ts[17] = 0.0f; ts[18] = 7.0f; ts[19] = 0.0f;
-        }
-
-        /* fp_k[]: the program's inline fragment constants, re-read from the
-         * guest ucode every draw. The decompiler emits fp_k[i] lookups instead
-         * of baking these in as literals, so the compiled shader no longer
-         * changes when the title re-patches them -- which is what forced the
-         * pipeline cache to key on a hash of the ucode bytes. */
+        u32 nk = 0;
         if (dr && dr->fp_addr) {
             extern uint8_t* vm_base;
             extern u32 cellGcmResolveLocated(int, u32);
+            static rsx_fp_constant_block k;   /* 32 KB: not on the stack */
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
-            if (vm_base && foff != 0xFFFFFFFFu)
-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
+            if (vm_base && foff != 0xFFFFFFFFu) {
+                int nc = rsx_fp_collect_constants(vm_base + foff, 4096, &k);
+                if (nc > 0 && nc <= VP_FP_MAX_CONSTS) {
+                    memcpy(cb, k.values, (size_t)nc * 16);
+                    nk = (u32)nc;
+                }
+            }
             /* FPK_DBG=1: the fragment constants as the shader will see them.
-             * A program whose only output is fp_k[0].xxxx renders black if
-             * those constants never arrive, which looks identical from the
+             * A program whose only output is fp_constants[0].xxxx renders black
+             * if those constants never arrive, which looks identical from the
              * outside to geometry that never rasterised. */
             { static int fk = -1; if (fk < 0) fk = getenv("FPK_DBG") ? 1 : 0;
               static int n = 0;
               if (fk && n < 12 && dr->fp_addr != 0x00EC2B02u) { n++;
-                  fprintf(stderr, "[FPK] tex0=0x%08X fp=0x%08X k0=(%g %g %g %g)"
-                                  " k1=(%g %g %g %g)%c",
-                          dr->tex[0].raw, dr->fp_addr,
-                          ts[20], ts[21], ts[22], ts[23],
-                          ts[24], ts[25], ts[26], ts[27], 10);
+                  const float* kf = (const float*)cb;
+                  fprintf(stderr, "[FPK] tex0=0x%08X fp=0x%08X %u consts", dr->tex[0].raw,
+                          dr->fp_addr, nk);
+                  if (nk >= 1) fprintf(stderr, " k0=(%g %g %g %g)", kf[0], kf[1], kf[2], kf[3]);
+                  if (nk >= 2) fprintf(stderr, " k1=(%g %g %g %g)", kf[4], kf[5], kf[6], kf[7]);
+                  fputc(10, stderr);
                   const u32 raw = dr->fp_addr & ~0x3u;
                   const u32 ea_main  = cellGcmResolveLocated(0, raw);
-                  const u32 ea_local = cellGcmResolveLocated(1, raw);
                   fprintf(stderr, "[FPK]   ucode main@0x%08X:", ea_main);
                   for (int b = 0; b < 48; b++) fprintf(stderr, "%s%02X", (b%16)?" ":"  |", vm_base[ea_main + b]);
                   fputc(10, stderr); }
@@ -3580,6 +3603,10 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                   if (!f && ns < 16) { seen[ns++] = dr->fp_addr;
                       fprintf(stderr, "[FPK] distinct fp #%d = 0x%08X%c", ns, dr->fp_addr, 10); } } }
         }
+        if (!nk) memset(cb, 0, 16);
+        float* fa = (float*)(cb + (nk ? nk : 1u) * 4u);
+        fa[0] = rsx_fp_alpha_ref(st->alpha_ref, st->surface_format & 0x1Fu);
+        fa[1] = 0.0f; fa[2] = 0.0f; fa[3] = 0.0f;
     }
     char* dst = (char*)s_d3d.vp_cb_mapped
         + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
@@ -4950,7 +4977,7 @@ static void render_frame(void)
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr),
-                                       dr->zs_key);
+                                       dr->zs_key, dr_alpha_func(dr));
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -5333,7 +5360,8 @@ static void render_frame(void)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_ctrl, dr->cmask, dr->cull,
-                                                dr_cube_mask(dr), dr->zs_key) : NULL;
+                                                dr_cube_mask(dr), dr->zs_key,
+                                                dr_alpha_func(dr)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
