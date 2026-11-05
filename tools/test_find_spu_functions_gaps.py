@@ -128,6 +128,40 @@ class UncoveredCodeSeeds(unittest.TestCase):
         code = insns([BI_R0, LNOP, BI_R0, LNOP, ri16(0x081, 1, 3), BI_R0, BI_R0])
         self.assertEqual(collect_uncovered_code_starts([0, 0x18], {}, code), [0x8, 0x10])
 
+    # A method whose own branch lands inside it: 0x04 il; 0x08 brz $r3,0x10;
+    # 0x0C ai; 0x10 label: ai; 0x14 bi $r0. Every branch target is a seed, so
+    # the walk from 0x04 meets the seed 0x10 before the return.
+    FORWARD_LABEL = [BI_R0, ri16(0x081, 1, 3), ri16(0x040, 2, 3), ri10(0x1C, 1, 3, 3),
+                     ri10(0x1C, 2, 3, 3), BI_R0, BI_R0]
+
+    def test_method_with_its_own_forward_label_is_seeded(self):
+        code = insns(self.FORWARD_LABEL)
+        self.assertEqual(collect_uncovered_code_starts([0, 0x10, 0x18], {}, code, {0x10: [0x8]}),
+                         [0x4])
+
+    def test_label_also_reached_from_outside_is_not_walked_past(self):
+        code = insns(self.FORWARD_LABEL)
+        self.assertEqual(collect_uncovered_code_starts([0, 0x10, 0x18], {}, code,
+                                                       {0x10: [0x8, 0x18]}), [])
+
+    def test_seed_that_is_called_or_named_is_not_walked_past(self):
+        # 0x10 is not in the label map: something calls or names it.
+        code = insns(self.FORWARD_LABEL)
+        self.assertEqual(collect_uncovered_code_starts([0, 0x10, 0x18], {}, code, {}), [])
+        self.assertEqual(collect_uncovered_code_starts([0, 0x10, 0x18], {}, code), [])
+
+    def test_last_seed_is_not_walked_past(self):
+        code = insns(self.FORWARD_LABEL)
+        self.assertEqual(collect_uncovered_code_starts([0, 0x10], {}, code, {0x10: [0x8]}), [])
+
+    def test_method_with_a_loop_is_seeded(self):
+        # 0x04 il; 0x08 loop: ai; 0x0C brnz $r3,0x08; 0x10 bi $r0. The label's
+        # branch comes after it, still inside the method.
+        code = insns([BI_R0, ri16(0x081, 1, 3), ri10(0x1C, 1, 3, 3), ri16(0x042, -1, 3),
+                      BI_R0, BI_R0])
+        self.assertEqual(collect_uncovered_code_starts([0, 0x8, 0x14], {}, code, {0x8: [0xC]}),
+                         [0x4])
+
     def test_lifter_emits_entries_for_the_methods(self):
         with tempfile.TemporaryDirectory() as tmp:
             elf = Path(tmp) / 'task.elf'
@@ -141,6 +175,68 @@ class UncoveredCodeSeeds(unittest.TestCase):
             for start in (METHOD_A, METHOD_B):
                 self.assertIn('spu_func_%08X(' % start, header)
             self.assertNotIn('spu_func_%08X(' % DATA, header)
+
+
+# An image whose unreferenced method branches to a label inside itself before
+# its return, as 0x23358 does in the title's task image (`brz $r5,0x233A0`
+# over a vtable call). detect_functions must work out that 0x24 is only that
+# method's label and seed the method; the label stays a seed of its own.
+METHOD_L, LABEL, C2 = 0x18, 0x24, 0x30
+TEXT_LABEL = [
+    ri16(0x066, MAIN >> 2, 0),           # 0x00 brsl $r0, main      (entry)
+    ri16(0x066, (C2 - 0x04) >> 2, 0),    # 0x04 brsl $r0, C2
+    STOP0,                               # 0x08 stop 0x0
+    LNOP,                                # 0x0C
+    ri16(0x081, 7, 3),                   # 0x10 il $r3, 7           main
+    BI_R0,                               # 0x14 bi $r0
+    ri16(0x081, 1, 3),                   # 0x18 il $r3, 1           method
+    ri16(0x040, (LABEL - 0x1C) >> 2, 3), # 0x1C brz $r3, label
+    ri10(0x1C, 1, 3, 3),                 # 0x20 ai $r3, $r3, 1
+    ri10(0x1C, 2, 3, 3),                 # 0x24 ai $r3, $r3, 2      label
+    BI_R0,                               # 0x28 bi $r0
+    LNOP,                                # 0x2C padding
+    ri16(0x081, 1, 3),                   # 0x30 il $r3, 1           C2
+    BI_R0,                               # 0x34 bi $r0
+]
+
+
+def label_elf(words=TEXT_LABEL):
+    text = b''.join(struct.pack('>I', w) for w in words)
+    buf = bytearray(TEXT_OFF + len(text))
+    buf[0:52] = struct.pack('>16sHHIIIIIHHHHHH',
+                            b'\x7fELF\x01\x02\x01' + bytes(9), 2, 23, 1, 0, 52,
+                            0, 0, 52, 32, 1, 40, 0, 0)
+    buf[52:84] = struct.pack('>IIIIIIII', 1, TEXT_OFF, 0, 0, len(text), len(text), 5, 0x80)
+    buf[TEXT_OFF:] = text
+    return bytes(buf)
+
+
+class LabelsInsideUnreferencedCode(unittest.TestCase):
+    def test_method_is_seeded_and_label_stays_a_seed(self):
+        funcs, _ = detect_functions(label_elf(), verbose=False)
+        self.assertIn((METHOD_L, LABEL), funcs)
+        self.assertIn((LABEL, LABEL + 8), funcs)
+        self.assertIn((MAIN, MAIN + 8), funcs)
+        self.assertIn((C2, C2 + 8), funcs)
+
+    def test_label_a_call_also_reaches_is_not_walked_past(self):
+        # The entry calls the label as well (0x08: brsl $r0, label instead of
+        # the stop), so it may be a function of its own: the method stays unseeded.
+        words = list(TEXT_LABEL)
+        words[2] = ri16(0x066, (LABEL - 0x08) >> 2, 0)
+        funcs, _ = detect_functions(label_elf(words), verbose=False)
+        self.assertNotIn(METHOD_L, {s for s, _ in funcs})
+
+    def test_lifter_emits_an_entry_for_the_method(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            elf = Path(tmp) / 'task.elf'
+            elf.write_bytes(label_elf())
+            out = Path(tmp) / 'out'
+            run = subprocess.run([sys.executable, str(TOOLS / 'spu_lifter.py'),
+                                  '--auto-functions', str(elf), '-o', str(out)],
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn('spu_func_%08X(' % METHOD_L, (out / 'spu_recomp.h').read_text())
 
 
 if __name__ == '__main__':

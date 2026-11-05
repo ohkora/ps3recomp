@@ -193,6 +193,31 @@ def collect_branch_targets(insns):
     return targets
 
 
+def collect_label_sources(insns, named):
+    """Targets of plain (non-call) branches that nothing calls or names, each
+    with the addresses of the branches that reach it.
+
+    These seeds are labels inside some function, not entries. `named` holds
+    every seed with another source: the entry point, symbols, call targets and
+    the reference scans. The gap pass may walk a candidate past such a label
+    when every branch to it comes from inside the candidate.
+    """
+    sources = {}
+    for ins in insns:
+        if ins.mnemonic not in _BRANCH_MNEMONICS or ins.mnemonic in ("brsl", "brasl"):
+            continue
+        for t in (t.strip() for t in ins.operands.split(",")):
+            if not t.startswith("0x"):
+                continue
+            try:
+                target = int(t, 16)
+            except ValueError:
+                continue
+            if target not in named:
+                sources.setdefault(target, []).append(ins.addr)
+    return sources
+
+
 def collect_link_register_targets(insns):
     """Addresses loaded into $r0 (the SPU ABI link register) by an immediate.
 
@@ -711,34 +736,56 @@ def _walk_end(start, limit, insns_by_addr):
     return limit
 
 
-def _looks_like_function(start, limit, insns_by_addr):
-    """Does `start` begin real code that ends the way functions end?
+def _function_end(start, k, sorted_starts, insns_by_addr, label_sources=None):
+    """Where the function a gap candidate at `start` begins ends, or None when
+    `start` does not begin real code that ends the way functions end.
 
     Words in an executable segment that are not code still mostly decode (1.0f
     is `rotqbyi`, -1 is `fms`), so decoding alone proves nothing. Require a
     first instruction that is neither undecodable nor `stop` (zero words decode
     as `stop 0`), then a run to a return or an unconditional branch with no
-    undecodable word and no terminal stop on the way. Running into `limit`
-    without such an end is rejected too: compiled functions do not fall
-    through into the next one.
+    undecodable word and no terminal stop on the way.
+
+    `sorted_starts[k]` is the next seed. Compiled functions do not fall
+    through into the next one, so running into a seed without such an end
+    rejects the candidate, with one exception: a seed that is one of the
+    candidate's own branch labels is walked past. Every branch target is a
+    seed, so without the exception any function with a forward branch or a
+    loop before its first return was rejected. A label qualifies when nothing
+    calls or names it (it is in `label_sources`, which maps such seeds to the
+    branches that reach them) and every one of those branches lies inside the
+    candidate, between `start` and the end the walk finds. A label any code
+    outside reaches, and the last seed, are never walked past.
     """
     first = insns_by_addr.get(start)
     if first is None or first.mnemonic in (".word", "stop", "stopd"):
-        return False
+        return None
+    crossed = []
     pc = start
-    while pc < limit:
+    while True:
+        if k >= len(sorted_starts):
+            return None
+        if pc >= sorted_starts[k]:
+            if not label_sources or sorted_starts[k] not in label_sources:
+                return None
+            crossed.append(sorted_starts[k])
+            k += 1
+            continue
         ins = insns_by_addr.get(pc)
         if ins is None or ins.mnemonic == ".word":
-            return False
+            return None
         if ins.mnemonic in ("stop", "stopd") and not is_resuming_stop(ins):
-            return False
+            return None
         if is_return(ins) or ins.mnemonic in ("br", "bra", "iret"):
-            return True
+            end = pc + 4
+            inside = all(start <= src < end
+                         for label in crossed for src in label_sources[label])
+            return end if inside else None
         pc += 4
-    return False
 
 
-def collect_uncovered_code_starts(sorted_starts, sized_by_start, insns_by_addr):
+def collect_uncovered_code_starts(sorted_starts, sized_by_start, insns_by_addr,
+                                  label_sources=None):
     """Functions after another function's end that nothing branches to.
 
     find_end closes a function at its first return (or another instruction
@@ -758,11 +805,14 @@ def collect_uncovered_code_starts(sorted_starts, sized_by_start, insns_by_addr):
     tasks the title waits for never finished.
 
     Each gap is walked from the end of the function before it: skip padding,
-    take the next instruction if _looks_like_function, continue after that
-    function's end, until the gap's next seed. Only gaps between two seeds
-    are searched; past the last one the executable segment often holds
-    .rodata. Existing functions keep their extents: this only adds starts in
-    code no function covered.
+    take the next instruction if _function_end finds where its function ends,
+    continue after that end, until the gap's next seed. A candidate may walk
+    past seeds that are its own branch labels (`label_sources`, see
+    _function_end): one in that same image, 0x23358, branches over a vtable
+    call with `brz $r5,0x233A0` before its return, and was rejected for
+    running into 0x233A0. Only gaps between two seeds are searched; past the
+    last one the executable segment often holds .rodata. Existing functions
+    keep their extents: this only adds starts in code no function covered.
     """
     found = []
     for i in range(len(sorted_starts) - 1):
@@ -772,10 +822,13 @@ def collect_uncovered_code_starts(sorted_starts, sized_by_start, insns_by_addr):
             a = end
             while a < nxt and getattr(insns_by_addr.get(a), "mnemonic", None) in _CODE_PADDING:
                 a += 4
-            if a >= nxt or not _looks_like_function(a, nxt, insns_by_addr):
+            if a >= nxt:
+                break
+            fn_end = _function_end(a, i + 1, sorted_starts, insns_by_addr, label_sources)
+            if fn_end is None:
                 break
             found.append(a)
-            end = _walk_end(a, nxt, insns_by_addr)
+            end = fn_end
     return found
 
 
@@ -830,12 +883,13 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     # A raw job binary has no crt0 and no data segment of its own to search.
     ctor_targets = set() if raw else collect_ctor_list_targets(
         buf, elf, code_start, code_end, insns_by_addr)
-    for t in (collect_link_register_targets(insns)
-              | collect_computed_branch_targets(insns)
-              | collect_jump_table_targets(insns, code, code_start, code_end)
-              | collect_ila_continuation_targets(insns, code_start, code_end)
-              | collect_duff_targets(insns, code_start, code_end)
-              | fptr_targets | ctor_targets):
+    ref_targets = (collect_link_register_targets(insns)
+                   | collect_computed_branch_targets(insns)
+                   | collect_jump_table_targets(insns, code, code_start, code_end)
+                   | collect_ila_continuation_targets(insns, code_start, code_end)
+                   | collect_duff_targets(insns, code_start, code_end)
+                   | fptr_targets | ctor_targets)
+    for t in ref_targets:
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
     if fptr_targets and verbose:
@@ -857,8 +911,11 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     # collect_uncovered_code_starts). A raw job blob mixes code and data more
     # freely, so it is left to the explicit seeds.
     if not raw:
+        named = ({elf["entry"]} | {s["addr"] for s in syms}
+                 | collect_brsl_targets(insns) | ref_targets)
         gap_starts = collect_uncovered_code_starts(sorted_starts, sized_by_start,
-                                                   insns_by_addr)
+                                                   insns_by_addr,
+                                                   collect_label_sources(insns, named))
         if gap_starts:
             seed_starts.update(gap_starts)
             sorted_starts = sorted(seed_starts)
