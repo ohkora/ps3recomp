@@ -173,9 +173,9 @@ def main():
                    "--symbol-prefix", prefix, "-o", outdir]
             if img in extra_funcs:
                 cmd += ["--extra-funcs", extra_funcs[img]]
+                print(f"[build_spu_workloads] {img}: extra entries {extra_funcs[img]}")
             if args.merge_chunks:
                 cmd += ["--merge-chunks"]
-                print(f"[build_spu_workloads] {img}: extra entries {extra_funcs[img]}")
             print(f"[build_spu_workloads] LIFT {img}  (prefix {prefix})")
             if subprocess.run(cmd).returncode != 0:
                 sys.exit(f"[build_spu_workloads] lift FAILED for {img}")
