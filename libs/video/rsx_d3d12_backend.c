@@ -4945,9 +4945,11 @@ static void render_frame(void)
             u32 wslot = DRAW_SRV_BASE + _d * VP_TEX_UNITS + (u32)_u;
             dr->tex_rt[_u] = -1;
             /* A depth-format unit (DEPTH24_D8 or DEPTH16, fixed or float) reads
-             * its depth surface itself: the depth in every channel, which is
-             * what a plain depth read and the program's depth comparison
-             * (_rsx_shadowN, which reads .r) both take. The replay makes the
+             * its depth surface itself. The view presents the depth on every
+             * channel the TEXTURE_CONTROL1 crossbar takes from the texture, and
+             * the crossbar's forced 0 and 1 as they are (0xA900 is depth in
+             * R, G and B with A = 1); the program's depth comparison
+             * (_rsx_shadowN) reads .r. The replay makes the
              * surface a shader resource before the draw. A draw cannot sample
              * the depth buffer it is testing against, and a depth texture with
              * no depth surface behind it has nothing to read, so in those two
@@ -4960,12 +4962,13 @@ static void render_frame(void)
                 if (ds >= 0 && ds != own) {
                     dr->tex_dz[_u] = ds;
                     srv_write(wslot, s_d3d.off_ds[ds].res, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
-                              D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0));
+                              rsx_remap_to_d3d(dr->tex[_u].ctrl1, dr->tex[_u].fmt & 0x9Fu));
                     { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
                         fprintf(stderr, "[D3D12] unit %d reads depth surface 0x%08X (%ux%u) as a"
-                                        " %ux%u texture, fmt 0x%02X, fp=0x%X%c", _u, dr->tex[_u].raw,
-                                s_d3d.off_ds[ds].w, s_d3d.off_ds[ds].h, dr->tex[_u].w,
-                                dr->tex[_u].h, dr->tex[_u].fmt, dr->fp_addr, 10); }
+                                        " %ux%u texture, fmt 0x%02X, crossbar 0x%04X, fp=0x%X%c",
+                                _u, dr->tex[_u].raw, s_d3d.off_ds[ds].w, s_d3d.off_ds[ds].h,
+                                dr->tex[_u].w, dr->tex[_u].h, dr->tex[_u].fmt,
+                                dr->tex[_u].ctrl1 & 0xFFFFu, dr->fp_addr, 10); }
                 } else {
                     { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
                         fprintf(stderr, "[D3D12] depth texture 0x%08X (fmt 0x%02X, unit %d) %s;"
