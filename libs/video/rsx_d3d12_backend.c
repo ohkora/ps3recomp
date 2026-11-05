@@ -5344,9 +5344,21 @@ static void render_frame(void)
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
+                int own_z = -2;                    /* this draw's depth surface; -2 = not looked up */
                 for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
                     const int ds = dr->tex_ds[_u];
-                    if (ds < 0 || ds == cur_z || s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)
+                    if (ds < 0 || s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)
+                        continue;
+                    /* A draw that writes the depth surface it samples reads a
+                     * feedback loop, so its copy is left as it is rather than
+                     * made again before each such draw. Every other draw gets a
+                     * fresh copy. The test was against cur_z, which here is still
+                     * the PREVIOUS draw's depth surface, so the first draw after
+                     * the pass that wrote it read an old copy. */
+                    if (own_z == -2)
+                        own_z = (dr->zeta_off && (dr->rt_off || dr->no_color))
+                              ? off_ds_find(dr->zeta_off) : -1;
+                    if (ds == own_z && (dr->zs_key & (2u | (1u << 5))))
                         continue;
                     ds_convert(ds, dr->tex_rt[_u]);
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
