@@ -39,6 +39,23 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
     out[3] = st->vertex_data4f[idx][3];
 
     const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
+    u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+    const u8* p;
+
+    /* An INLINE_ARRAY primitive (rsx_commands.c): its vertices came down the
+     * FIFO, packed in ascending attribute order, and are read from that copy.
+     * Array offsets, strides and frequencies do not describe the stream. An
+     * attribute it does not carry keeps the constant register, as above. */
+    if (st->inline_src) {
+        if (!a->enabled || !a->type) return;
+        u32 need = rsx_vertex_attrib_size(a->type, n);
+        if (!need) need = n * 4;          /* an unknown type is read as floats, below */
+        const u64 at = (u64)vi * st->inline_stride + st->inline_off[idx];
+        if (at + need > st->inline_bytes) return;
+        p = st->inline_src + at;
+        goto decode;
+    }
+
     if (!a->enabled || a->stride == 0 || !vm_base) return;
 
     /* Vertex frequency divisor (instancing). An ordinary array
@@ -72,11 +89,11 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
      * collapsed to the origin, while non-indexed geometry whose arrays lie
      * outside the shadowed pages drew fine. */
     u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
-    const u8* p = vm_base + ((a->offset & 0x80000000u)
+    p = vm_base + ((a->offset & 0x80000000u)
         ? cellGcmResolveLocated(0, off)   /* MAIN:  IO offset table          */
         : cellGcmResolveLocated(1, off)); /* LOCAL: VRAM, never the IO table */
 
-    u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+decode:
     switch (a->type) {
     case 2: /* CELL_GCM_VERTEX_F: float32 BE */
         for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);

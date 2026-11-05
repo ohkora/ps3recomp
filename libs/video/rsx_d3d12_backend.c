@@ -6124,6 +6124,25 @@ static void read_rsx_vertex(const rsx_state* state, u32 vindex, BasicVertex* out
     out->u = out->v = 0.0f;
     if (!state || !vm_base) return;
 
+    /* An INLINE_ARRAY primitive (rsx_commands.c): its vertices are in the
+     * FIFO copy that rsx_fetch_attrib reads, not at the array offsets. */
+    if (state->inline_src) {
+        float f[4];
+        const rsx_vertex_attrib* pa = &state->vertex_attribs[0];
+        const rsx_vertex_attrib* ca = &state->vertex_attribs[3];
+        if (pa->enabled && pa->type == 2 /* float */ && pa->size >= 2) {
+            rsx_fetch_attrib(state, 0, vindex, f);
+            out->x = f[0]; out->y = f[1];
+            if (pa->size >= 3) out->z = f[2];
+        }
+        if (ca->enabled && ca->size >= 3) {
+            rsx_fetch_attrib(state, 3, vindex, f);
+            out->r = f[0]; out->g = f[1]; out->b = f[2];
+            out->a = ca->size >= 4 ? f[3] : 1.0f;
+        }
+        return;
+    }
+
     const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
     if (pos->enabled && pos->type == 2 /* float */ && pos->size >= 2) {
         u8* src = vm_base + cellGcmResolveOffset(pos->offset + vindex * pos->stride);
