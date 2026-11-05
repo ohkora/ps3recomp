@@ -19,6 +19,11 @@
  * does, then checks that its cache buffer still holds what the cache DMA list
  * pointed at, and that it can push one more frame without leaving its stack.
  *
+ * It also checks word 1 of $sp, the SPU ABI's available stack space. Code
+ * built with stack checking takes each frame off that word too and halts when
+ * it goes negative. PlayStation All-Stars Battle Royale's job halted in its
+ * first checked prologue because the runner left the word at 0.
+ *
  * Build:
  *   clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
  *         -o /tmp/test_spurs_job_stack \
@@ -102,7 +107,7 @@ static void build_job(uint16_t stack_qw, uint16_t scratch_qw)
 
 /* What the entry saw. */
 static int      g_ran, g_cache_intact, g_frames_in_stack;
-static uint32_t g_cache_ls, g_sp;
+static uint32_t g_cache_ls, g_sp, g_avail, g_scratch_ls;
 
 /* The prologue every SPU function starts with: save $lr in the caller's
  * frame, then push a frame of its own and store the back chain. */
@@ -111,6 +116,8 @@ static void job_entry(spu_context* ctx)
     const uint32_t sp = ctx->gpr[1]._u32[0];
     g_ran = 1;
     g_sp = sp;
+    g_avail = ctx->gpr[1]._u32[1];
+    g_scratch_ls = ls_get32(ctx, ctx->gpr[3]._u32[0] + 0x20u);   /* sBuffer */
     memcpy(ctx->ls + ((sp + 16u) & SPU_LS_MASK), &ctx->gpr[0], 16);   /* stqd $lr,16($sp) */
     const uint32_t nsp = sp - 0x40u;                                   /* stqu $sp,-64($sp) */
     memcpy(ctx->ls + (nsp & SPU_LS_MASK), &ctx->gpr[1], 16);
@@ -130,12 +137,24 @@ static void run_case(const char* name, uint16_t stack_qw, uint16_t scratch_qw)
     TEST(name);
     build_job(stack_qw, scratch_qw);
     g_ran = g_cache_intact = g_frames_in_stack = 0;
+    g_avail = g_scratch_ls = 0;
     spu_run_spurs_job(job_entry, 7, JOB_EA, 256);
     CHECK(g_ran);
     CHECK(g_cache_intact);
     CHECK(g_frames_in_stack);
     if (!g_cache_intact || !g_frames_in_stack)
         fprintf(stderr, "  $sp=0x%05X cacheBuffer[0]=0x%05X\n", g_sp, g_cache_ls);
+
+    /* Available stack: down to the end of the scratch area, no further. */
+    const uint32_t stack_bytes = stack_qw ? (uint32_t)stack_qw << 4 : 8192u;
+    const uint32_t scratch_end = g_scratch_ls + ((uint32_t)scratch_qw << 4);
+    CHECK((int32_t)g_avail > 0);
+    CHECK(g_avail == g_sp - scratch_end);
+    /* The whole requested stack, less the caller's 32-byte frame, fits. */
+    CHECK(g_avail >= stack_bytes - 32u);
+    if ((int32_t)g_avail <= 0 || g_avail != g_sp - scratch_end)
+        fprintf(stderr, "  $sp=0x%05X avail=0x%X scratch end=0x%05X\n",
+                g_sp, g_avail, scratch_end);
 }
 
 int main(void)

@@ -375,6 +375,14 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * got width = height = 0). Leave the caller's 32-byte frame inside the
      * stack. */
     ctx.gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
+    /* Word 1 of $sp is the SPU ABI's available stack space: the bytes
+     * between $sp and the lowest address the stack may reach, here the end
+     * of the scratch area that shares its block. Every frame's `ai $sp,
+     * $sp, -n` takes n off both words, and code built with stack checking
+     * halts as soon as word 1 goes negative. Left at 0, the first checked
+     * prologue of PlayStation All-Stars Battle Royale's job took it to -96
+     * and halted before the job did any work. */
+    ctx.gpr[1]._u32[1] = ctx.gpr[1]._u32[0] - (s_ls + size_scr);
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
