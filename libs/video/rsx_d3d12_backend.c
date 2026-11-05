@@ -1583,7 +1583,7 @@ static void dump_backbuffer_bmp(void)
 
 /* ---------------------------------------------------------------------------
  * RSX frame capture ("rsxcap") -- a purpose-built GPU debugger. RSX_CAP=start
- * [:count[:stride]] snapshots whole frames to <RSX_CAP_DIR>/frame_NN/: a text
+ * [:count[:stride]][,...] snapshots whole frames to <RSX_CAP_DIR>/frame_NN/: a text
  * manifest of every op (in submission order, with full surface/shader/texture
  * state) plus a BMP of the backbuffer and every offscreen colour RT used that
  * frame. One frame, captured atomically -- no cross-frame guessing.
@@ -6098,26 +6098,39 @@ skip_dump_consider: ;
     }
 
     /* rsxcap: snapshot whole frames (backbuffer + every offscreen RT + a draw
-     * manifest) at RSX_CAP=start[:count[:stride]] frame_counts. Runs before the
+     * manifest) at RSX_CAP=start[:count[:stride]][,...] frame_counts. Runs before the
      * present transition would matter -- the backbuffer is in PRESENT here and
      * is restored to PRESENT after each readback. */
     { const char* cap = env_str("RSX_CAP", &s_env_rsx_cap);
       if (cap) {
-        static int s_cap_parsed = 0;
-        static u32 s_cap_start = 0, s_cap_count = 1, s_cap_stride = 1, s_cap_done = 0;
-        if (!s_cap_parsed) {
-            s_cap_parsed = 1;
-            u32 a = 0, b = 1, c = 1;
-            int n = sscanf(cap, "%u:%u:%u", &a, &b, &c);
-            s_cap_start  = (n >= 1 && a) ? a : 200;
-            s_cap_count  = (n >= 2 && b) ? b : 1;
-            s_cap_stride = (n >= 3 && c) ? c : 1;
+        /* Up to 4 comma-separated ranges, e.g. a few menu frames and then a
+         * close series in a level: RSX_CAP=2900:4:1100,8850:60:15. Frames
+         * are numbered on across the ranges. */
+        enum { CAP_RANGES = 4 };
+        static int s_cap_nr = -1;
+        static u32 s_cap_start[CAP_RANGES], s_cap_count[CAP_RANGES], s_cap_stride[CAP_RANGES],
+                   s_cap_done[CAP_RANGES], s_cap_idx;
+        if (s_cap_nr < 0) {
+            s_cap_nr = 0;
+            for (const char* e = cap; e && *e && s_cap_nr < CAP_RANGES; ) {
+                u32 a = 0, b = 1, c = 1;
+                int n = sscanf(e, "%u:%u:%u", &a, &b, &c);
+                if (n < 1) break;
+                s_cap_start[s_cap_nr]  = a ? a : 200;
+                s_cap_count[s_cap_nr]  = (n >= 2 && b) ? b : 1;
+                s_cap_stride[s_cap_nr] = (n >= 3 && c) ? c : 1;
+                s_cap_nr++;
+                e = strchr(e, ',');
+                if (e) e++;
+            }
         }
-        if (s_cap_done < s_cap_count) {
-            u32 target = s_cap_start + s_cap_done * s_cap_stride;
+        for (int r = 0; r < s_cap_nr; r++) {
+            if (s_cap_done[r] >= s_cap_count[r]) continue;
+            u32 target = s_cap_start[r] + s_cap_done[r] * s_cap_stride[r];
             if (s_d3d.frame_count >= target && s_dbg_last_draws > 0) {
-                rsx_capture_frame(fi, s_dbg_last_draws, s_cap_done);
-                s_cap_done++;
+                rsx_capture_frame(fi, s_dbg_last_draws, s_cap_idx++);
+                s_cap_done[r]++;
+                break;   /* one capture a frame */
             }
         }
       } }
