@@ -2,14 +2,17 @@
  * ps3recomp - cellSpursJq HLE implementation
  *
  * SPURS Job Queue — manages job submission and tracking.
- * Jobs are accepted and immediately marked as complete (no SPU execution).
- * This satisfies games that check for job completion but don't depend
- * on SPU side effects.
+ * The original push entry points accept jobs and mark them complete without
+ * running them. The port2 push (_cellSpursJobQueuePort2PushJobBody) runs
+ * the job's lifted SPU binary before it returns; see the port2 section.
  */
 
 #include "cellSpursJq.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
+#include "spu_workload.h"   /* spu_workload_dispatch_job: lifted SPURS job dispatch */
+#include "ps3emu/log_first.h"
 #include <stdio.h>
+#include <stdlib.h>   /* getenv */
 #include <string.h>
 
 /* Internal state */
@@ -199,6 +202,132 @@ s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
     if (!port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
     CellSpursJobQueue jq = *port;
     return jq_push_host((const u32*)&jq, job, jobSize, tag, id);
+}
+
+/* ---------------------------------------------------------------------------
+ * Port2 job submission: the job actually runs.
+ *
+ * _cellSpursJobQueuePort2PushJobBody (the body behind the SDK's inline
+ * cellSpursJobQueuePort2PushJob) hands the queue a CellSpursJobHeader -- the
+ * same 48-byte header a job chain uses (eaBinary, sizeBinary, DMA lists, ...)
+ * followed by the job's user data. On hardware the job-queue policy module
+ * grabs it on an SPU, stages it in local store and enters the job's CRT.
+ *
+ * Unregistered, both port2 imports faked CELL_OK: the pushes were dropped, the
+ * Sync "succeeded" at once, and the PPU went on to consume output the job
+ * never wrote. PlayStation All-Stars (BCUS98472) does exactly that on its load
+ * screen -- 11 pushes and 23 syncs, then a black frame for the whole load.
+ *
+ * We run the job synchronously on the pushing thread, through the same
+ * fingerprint -> lifted-entry dispatch and jm2-style staging the job-chain
+ * walker uses (spu_workload_dispatch_job / spu_run_spurs_job). A push returns
+ * once the job has completed, so every job pushed through a port has finished
+ * by the time the PPU calls Sync, and Sync has nothing left to wait for. An
+ * unlifted binary is reported as a dispatch MISS (and dumped with
+ * SPU_DUMP_MISS) instead of vanishing silently.
+ *
+ * Only the job pointer and descriptor size are needed, so the port object is
+ * not interpreted. SPURS_JQ_TRACE=1 prints the raw arguments of every port2
+ * call, to check the call sites against this ABI on a new title.
+ * -----------------------------------------------------------------------*/
+enum {                              /* CellSpursJobHeader, job_descriptor.h */
+    JQ_JH_EA_BINARY   = 0x00,       /* be u64: binary EA, low bits = flags */
+    JQ_JH_SIZE_BINARY = 0x08,       /* be u16: binary size >> 4           */
+    JQ_JH_SIZE        = 0x30,
+};
+
+/* Top of the guest range a job may live in. ppu_vm_size is 0 until the
+ * loader maps the image (and in unit tests that never set it); RSX local
+ * memory at 0xC0000000 never holds a job, so cap there. */
+extern uint32_t ppu_vm_size;
+static u64 jq_guest_limit(void)
+{
+    return ppu_vm_size ? (u64)ppu_vm_size : 0xC0000000ull;
+}
+
+static int jq_trace(void)
+{
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("SPURS_JQ_TRACE"); s = (e && *e && *e != '0') ? 1 : 0; }
+    return s;
+}
+
+/* Counters, readable by tests. */
+u32 g_spurs_jq_port2_pushed;     /* pushes that reached a job binary   */
+u32 g_spurs_jq_port2_ran;        /* ... of which a lifted job ran      */
+u32 g_spurs_jq_port2_rejected;   /* pushes refused as invalid          */
+
+static s32 jq_port2_push(const char* who, u32 port_ea, u32 job_ea,
+                         u32 size_desc, u32 tag, u32 flag)
+{
+    if (jq_trace())
+        fprintf(stderr, "[cellSpursJq] %s(port=0x%08X job=0x%08X sizeDesc=%u tag=%u flag=0x%X)\n",
+                who, port_ea, job_ea, size_desc, tag, flag);
+
+    /* The header is 16-byte aligned on every path the SDK allows (128 for a
+     * queue descriptor), and its binary must lie inside guest memory. */
+    if (!port_ea || !job_ea || (job_ea & 0xF) ||
+        (u64)job_ea + JQ_JH_SIZE > jq_guest_limit()) {
+        g_spurs_jq_port2_rejected++;
+        { static int _n = 0;
+          if (PS3_LOG_FIRST(_n, 8))
+              fprintf(stderr, "[cellSpursJq] %s: bad port/job (port=0x%08X job=0x%08X) -- rejected\n",
+                      who, port_ea, job_ea); }
+        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+    }
+
+    u32 ea_bin   = (u32)(vm_read64(job_ea + JQ_JH_EA_BINARY) & ~0xFull);
+    u32 size_bin = (u32)vm_read16(job_ea + JQ_JH_SIZE_BINARY) << 4;
+    if (!ea_bin || !size_bin || size_bin > 0x40000u ||
+        (u64)ea_bin + size_bin > jq_guest_limit()) {
+        g_spurs_jq_port2_rejected++;
+        { static int _n = 0;
+          if (PS3_LOG_FIRST(_n, 8))
+              fprintf(stderr, "[cellSpursJq] %s: job 0x%08X has no plausible binary "
+                              "(ea=0x%08X size=%u) -- rejected\n",
+                      who, job_ea, ea_bin, size_bin); }
+        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* sizeDesc is the descriptor's byte size (64, 128, 256, ... up to 1 KB).
+     * Anything else is not a size this ABI knows: run with jm2's default
+     * rather than copy a wild length into local store. */
+    if (size_desc < 64 || size_desc > 1024 || (size_desc & 15)) size_desc = 0;
+
+    g_spurs_jq_port2_pushed++;
+    { static int _n = 0;
+      if (PS3_LOG_FIRST(_n, 4))
+          fprintf(stderr, "[cellSpursJq] %s: job 0x%08X bin 0x%08X+%u sizeDesc=%u -- running\n",
+                  who, job_ea, ea_bin, size_bin, size_desc); }
+    if (spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc))
+        g_spurs_jq_port2_ran++;
+    /* A MISS is reported by the dispatcher itself. The push still succeeds,
+     * like a job chain's: the SDK has no error for "job did nothing", and
+     * failing it would only send the title down an error path real hardware
+     * never takes. */
+    return CELL_OK;
+}
+
+/* SDK: _cellSpursJobQueuePort2PushJobBody(CellSpursJobQueuePort2* port,
+ *          CellSpursJobHeader* job, unsigned sizeDesc, unsigned tag,
+ *          unsigned flag) */
+s32 _cellSpursJobQueuePort2PushJobBody(u64 port, u64 job, u64 sizeDesc,
+                                       u64 tag, u64 flag)
+{
+    return jq_port2_push("Port2PushJobBody", (u32)port, (u32)job,
+                         (u32)sizeDesc, (u32)tag, (u32)flag);
+}
+
+/* SDK: cellSpursJobQueuePort2Sync(CellSpursJobQueuePort2* port, unsigned flag)
+ * Waits for every job pushed through the port. Pushes run to completion
+ * before they return, so there is nothing outstanding. */
+s32 cellSpursJobQueuePort2Sync(u64 port, u64 flag)
+{
+    if (jq_trace())
+        fprintf(stderr, "[cellSpursJq] Port2Sync(port=0x%08X flag=0x%X) pushed=%u ran=%u\n",
+                (u32)port, (u32)flag, g_spurs_jq_port2_pushed, g_spurs_jq_port2_ran);
+    if (!(u32)port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+    return CELL_OK;
 }
 
 s32 cellSpursJobQueueSendSignal(CellSpursJobQueue* jq, CellSpursJobId id)

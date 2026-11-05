@@ -3,7 +3,8 @@
  *
  * SPURS Job Queue — advanced SPU job dispatch built on cellSpurs.
  * Provides job queue creation, enqueue, dequeue, and synchronization.
- * Stub — management APIs work, no actual SPU execution.
+ * Management APIs are bookkeeping only; the port2 push runs the job's lifted
+ * SPU binary (see cellSpursJq.c).
  */
 
 #ifndef PS3RECOMP_CELL_SPURS_JQ_H
@@ -99,6 +100,13 @@ s32 cellSpursJobQueuePort2Destroy(CellSpursJobQueuePort* port);
 s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
                                    const void* job, u32 jobSize,
                                    u32 tag, CellSpursJobId* id);
+
+/* Port2 push/sync: the job runs before the push returns. Raw register-width
+ * arguments: port and job are guest EAs. */
+s32 _cellSpursJobQueuePort2PushJobBody(u64 port, u64 job, u64 sizeDesc,
+                                       u64 tag, u64 flag);
+s32 cellSpursJobQueuePort2Sync(u64 port, u64 flag);
+extern u32 g_spurs_jq_port2_pushed, g_spurs_jq_port2_ran, g_spurs_jq_port2_rejected;
 
 s32 cellSpursJobQueueSendSignal(CellSpursJobQueue* jq, CellSpursJobId id);
 s32 cellSpursJobQueueWait(CellSpursJobQueue* jq, CellSpursJobId id);
