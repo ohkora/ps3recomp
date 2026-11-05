@@ -5,12 +5,15 @@ Find SPU function boundaries inside an embedded SPU ELF.
 Emits a JSON list of {"start": addr, "end": addr} ready for
 `spu_lifter.py --functions`.
 
-Seeds the function set from four sources:
+Seeds the function set from these sources (detect_functions has the rest):
   1. ELF entry point (e_entry).
   2. Symbol table -- STT_FUNC entries (with their st_value/st_size if size
      is non-zero, which gives us *exact* boundaries when present).
   3. All brsl/brasl targets the disassembler can resolve in the code.
-  4. Addresses loaded into $r0 by `il`/`ila` -- the link-register resume
+  4. Static constructor/destructor lists (.ctors, .dtors, .init_array ...),
+     which name functions nothing in the code branches to
+     (see collect_ctor_list_targets).
+  5. Addresses loaded into $r0 by `il`/`ila` -- the link-register resume
      idiom (see collect_link_register_targets).
 
 For each function start without a symbol-provided size, the end is
@@ -545,6 +548,83 @@ def collect_function_pointer_tables(buf, phs, code_start, code_end,
     return targets
 
 
+# Sections that hold lists of code addresses the C runtime calls at start-up
+# or exit: GCC's .ctors/.dtors (a -1 head, the entries, a 0 tail) and the
+# ELF-standard *_array forms (bare entries).
+_CTOR_LIST_SECTIONS = (".ctors", ".dtors", ".init_array", ".fini_array",
+                       ".preinit_array")
+# Instructions after which execution does not fall through: what precedes a
+# function start (with padding).
+_NO_FALLTHROUGH = {"bi", "br", "bra", "iret", "stop", "stopd", "nop", "lnop"}
+
+
+def collect_ctor_list_targets(buf, elf, code_start, code_end, insns_by_addr):
+    """Static constructors and destructors: functions only a start-up list names.
+
+    crt0 runs a C++ program's global constructors before main. GCC's
+    __do_global_ctors_aux walks the .ctors list from its last entry back to the
+    -1 head and calls each entry through a register (`bisl $r0,$r3`). Nothing
+    in .text refers to a constructor -- its address exists only in the list --
+    so none of the code scans see it, and collect_function_pointer_tables wants
+    three entries in a row while a list usually holds one or two. Unseeded, the
+    constructor sits in a gap between two lifted functions, the call misses in
+    spu_indirect_branch, and the runtime ends the task before its main has run.
+    Observed: a SPURS task image in PlayStation All-Stars Battle Royale whose
+    .ctors holds one entry, {-1, 0x248C8, 0} at the start of its data segment;
+    both tasks the title created from it ended at that call, and the title
+    waited for their work forever.
+
+    With section names, the named list sections are read whole. A stripped
+    image (no names) is searched for GCC's list shape instead: a -1 word, one
+    or more code addresses, then a 0 word. There each address must also follow
+    an instruction that does not fall through (or padding), as a function start
+    does, so a -1 / small number / 0 run in ordinary data cannot split a
+    function.
+    """
+    def is_code(w):
+        return (w & 3) == 0 and code_start <= w < code_end and w in insns_by_addr
+
+    targets = set()
+    named = False
+    for sh in elf["shs"]:
+        if sh.get("name"):
+            named = True
+        if sh.get("name") not in _CTOR_LIST_SECTIONS or sh["type"] == 8:   # NOBITS
+            continue
+        data = buf[sh["off"]:sh["off"] + sh["size"]]
+        for i in range(0, len(data) - 3, 4):
+            w = int.from_bytes(data[i:i + 4], "big")
+            if w not in (0, 0xFFFFFFFF) and is_code(w):
+                targets.add(w)
+    if named:
+        return targets
+
+    def starts_function(a):
+        if a == code_start:
+            return True
+        prev = insns_by_addr.get(a - 4)
+        return prev is not None and prev.mnemonic in _NO_FALLTHROUGH
+
+    for ph in elf["phs"]:
+        if ph.get("type") != 1:            # PT_LOAD only
+            continue
+        seg = buf[ph["off"]:ph["off"] + ph["filesz"]]
+        skew = (-ph["vaddr"]) & 3          # keep words on the LS 4-byte grid
+        words = [int.from_bytes(seg[i:i + 4], "big")
+                 for i in range(skew, len(seg) - 3, 4)]
+        for k, w in enumerate(words):
+            if w != 0xFFFFFFFF:
+                continue
+            run, j = [], k + 1
+            while (j < len(words) and words[j] not in (0, 0xFFFFFFFF)
+                   and is_code(words[j]) and starts_function(words[j])):
+                run.append(words[j])
+                j += 1
+            if run and j < len(words) and words[j] == 0:
+                targets.update(run)
+    return targets
+
+
 # Kept for backwards compatibility / call-only counting.
 def collect_brsl_targets(insns):
     return {t for ins in insns if ins.mnemonic in ("brsl", "brasl")
@@ -653,17 +733,23 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     # hold a small constant cannot seed a bogus function.
     fptr_targets = collect_function_pointer_tables(
         buf, elf["phs"], code_start, code_end, insns_by_addr)
+    # A raw job binary has no crt0 and no data segment of its own to search.
+    ctor_targets = set() if raw else collect_ctor_list_targets(
+        buf, elf, code_start, code_end, insns_by_addr)
     for t in (collect_link_register_targets(insns)
               | collect_computed_branch_targets(insns)
               | collect_jump_table_targets(insns, code, code_start, code_end)
               | collect_ila_continuation_targets(insns, code_start, code_end)
               | collect_duff_targets(insns, code_start, code_end)
-              | fptr_targets):
+              | fptr_targets | ctor_targets):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
     if fptr_targets and verbose:
         print(f"  {len(fptr_targets)} data function-pointer-table target(s): "
               f"{', '.join(f'0x{a:X}' for a in sorted(fptr_targets))}")
+    if ctor_targets and verbose:
+        print(f"  {len(ctor_targets)} constructor/destructor list target(s): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(ctor_targets))}")
 
     # Always cover the entry of the text segment itself (some images have no
     # entry point but a function at va 0).
