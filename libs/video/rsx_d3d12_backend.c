@@ -423,7 +423,8 @@ static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
  * hard-coded offset in a filter silently matches nothing and the run looks like
  * "renders nothing" -- which cost real time. DRAW_KEEP_TEX=duck resolves here. */
 /* Copy of the last completed frame, bound wherever a draw samples a
- * DISPLAY-SIZED texture. On RSX this title renders its reflection into a corner
+ * DISPLAY-SIZED texture that no offscreen RT backs (an RT at the texture's
+ * offset is sampled directly). On RSX this title renders its reflection into a corner
  * of the render surface and then samples that surface as a texture; our backend
  * renders into a D3D backbuffer, so the guest memory behind that sampler is
  * never written and it reads empty -- which is why the water had no reflection.
@@ -4823,7 +4824,26 @@ static void render_frame(void)
                     continue;
                 }
             }
-            /* Display-sized sampler source -> the rendered frame. */
+            /* A surface this backend rendered: sample the offscreen RT itself.
+             * This must win over the two fallbacks below, which stand in for
+             * guest memory that nothing on the host wrote. Checked after them,
+             * a title whose offscreen scene target is display-sized
+             * (PlayStation All-Stars Battle Royale renders its scene into a
+             * 1280x720 surface, then downsamples and composites it) had every
+             * read of that target replaced by the previous frame's backbuffer.
+             * Its composite then sampled its own last output, and the window
+             * settled on one flat colour while the scene RT held the image. */
+            if (dr->tex[_u].set) {
+                int rt = off_rt_find(dr->tex[_u].raw);
+                if (rt >= 0) {
+                    dr->tex_rt[_u] = rt;
+                    srv_write(wslot, s_d3d.off_rt[rt].res, (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    continue;
+                }
+            }
+            /* Display-sized sampler source with no RT behind it -> the
+             * rendered frame. */
             if (dr->tex[_u].set && s_screen_copy &&
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
                 static int en = -1;
@@ -4861,13 +4881,6 @@ static void render_frame(void)
                 }
             }
             if (dr->tex[_u].set) {
-                int rt = off_rt_find(dr->tex[_u].raw);
-                if (rt >= 0) {
-                    dr->tex_rt[_u] = rt;
-                    srv_write(wslot, s_d3d.off_rt[rt].res, (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
-                    continue;
-                }
                 u32 _bf = dr->tex[_u].fmt & 0x9F;
                 if (dr->tex[_u].off &&
                     (_bf == 0x81 || _bf == 0x85 || _bf == 0x8B ||
