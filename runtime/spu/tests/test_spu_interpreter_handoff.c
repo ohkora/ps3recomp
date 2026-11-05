@@ -15,6 +15,7 @@ extern void spu_begin_image(int);
 extern void spu_register_function(uint32_t, void (*)(spu_context*));
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 extern void spu_halt(spu_context*);
+extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited; /* spurs_policy.c */
 static spu_context ctx;
 static void word(uint32_t pc, uint32_t w) {
     ctx.ls[pc] = w >> 24; ctx.ls[pc+1] = w >> 16;
@@ -116,6 +117,23 @@ int main(int argc, char** argv) {
     } else if (!strcmp(mode, "stepcap") || !strcmp(mode, "negative-stepcap")) {
         word(0x4004, 0x04000082);
         word(0x4008, 0x30004800);
+    } else if (!strncmp(mode, "pm-", 3)) {
+        /* A policy module running interpreted calls the HLE kernel's two
+         * services. Local store holds no code at those addresses, so plant a
+         * decoy there: interpreting it bumps r21 (wrong-cont) and ends in
+         * finish, which the asserts below reject. */
+        word(0x9C0, 0x1C004A95); /* ai $21,$21,1 */
+        word(0x9C4, 0x30004800); /* bra 0x240 */
+        word(0x9D0, 0x1C004A95); /* ai $21,$21,1 */
+        word(0x9D4, 0x30004800); /* bra 0x240 */
+        ctx.gpr[3]._u32[0] = 0xDEADBEEFu;
+        if (!strcmp(mode, "pm-exit")) {
+            word(0x4004, 0x30013800); /* bra 0x9C0: exitToKernel */
+        } else {
+            word(0x4004, 0x31013A00); /* brasl $0,0x9D0: selectWorkload (poll) */
+            word(0x4008, 0x04000082); /* ori $2,$1,0: the return site is interpreted too */
+            word(0x400C, 0x30004800); /* bra 0x240 */
+        }
     } else if (!strcmp(mode, "pure-interpreter")) {
         word(0x4004, 0x30004800);
         uint32_t pc = spu_interp_run_until(&ctx, 0x4000, 0);
@@ -135,6 +153,19 @@ int main(int argc, char** argv) {
         puts("PASS"); return 0;
     }
     assert(ctx.gpr[21]._u32[0] == 0);
+    if (!strcmp(mode, "pm-exit")) {
+        /* The kernel took the exit: the run stops there, nothing after it runs. */
+        assert(g_spurs_pm_exited == 1 && g_spurs_pm_polls == 0);
+        assert(halted == 1 && ctx.status == SPU_STATUS_STOPPED_BY_STOP);
+        assert((ctx.pc & 0x3FFFC) == 0x9C0 && ctx.gpr[11]._u32[0] == 0);
+        puts("PASS"); return 0;
+    }
+    if (!strcmp(mode, "pm-poll")) {
+        /* The poll answered "keep running" (r3 = 0) and the module carried on
+         * at its own return address, still interpreted, to the end. */
+        assert(g_spurs_pm_polls == 1 && g_spurs_pm_exited == 0);
+        assert(ctx.gpr[3]._u32[0] == 0);
+    }
     if (!strncmp(mode, "smc-ldst", 8)) {
         for (int k = 0; k < 4; k++) {
             const uint32_t v5 = ctx.gpr[5]._u32[k], v6 = ctx.gpr[6]._u32[k];

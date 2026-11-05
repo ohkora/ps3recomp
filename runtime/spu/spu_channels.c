@@ -2585,10 +2585,16 @@ static int spu_smc_microstep(spu_context* ctx)
          * drains can repair an empty trampoline, but the top-level driver
          * otherwise ends the run before executing the lifted target.
          * An already-owning drain must retain its own host continuation;
-         * stopped states and diagnostic exits keep their existing behavior. */
+         * stopped states and diagnostic exits keep their existing behavior.
+         * A policy module's branch to a kernel service is the same kind of
+         * transfer: the interpreter stops there (spu_interp.c) and
+         * spu_indirect_branch serves it. */
+        const uint32_t ipc = ctx->pc & SPU_LS_MASK;
+        const int kernel_svc = ctx->policy_mode &&
+            (ipc == SPURS_PM_EXIT_TO_KERNEL_LS || ipc == SPURS_PM_SELECT_WORKLOAD_LS);
         if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
-            (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
-            spu_lifted_lookup(ctx, ctx->pc)) {
+            (!return_pc || ipc != return_pc) &&
+            (kernel_svc || spu_lifted_lookup(ctx, ctx->pc))) {
             g_spu_trampoline_fn = spu_indirect_branch;
             return 1;
         }
@@ -2655,6 +2661,13 @@ void spu_indirect_branch(spu_context* ctx)
                           n, ctx->gpr[3]._u32[0]); }
             ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+            /* Return to the caller the way SPU_RET does. A lifted caller made
+             * a host call and its frame resumes; a branch that reached here
+             * as a transfer (an interpreted module's call, handed over by the
+             * microstep) has no host frame to resume, and at the top level an
+             * empty trampoline ends the run instead of continuing at r0. */
+            if (ctx->host_depth == 0)
+                g_spu_trampoline_fn = spu_indirect_branch;
             return;
         }
     }

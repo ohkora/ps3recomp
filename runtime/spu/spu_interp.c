@@ -492,6 +492,18 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 continue;
             }
         }
+        /* The SPURS kernel's two services sit at reserved addresses that the
+         * HLE kernel plants in a policy module's kernel context
+         * (spurs_policy.c) and serves in spu_indirect_branch. Local store
+         * holds no kernel code there, so interpreting on would run whatever
+         * bytes happen to sit at 0x9C0/0x9D0. Stop on them as on a lifted
+         * entry and let the caller hand the branch to the dispatcher.
+         * PlayStation All-Stars Battle Royale's sound policy module runs
+         * mostly here and exits through 0x9C0; it fell into branch-to-0. */
+        if (ctx->policy_mode && (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
+                                 ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS)) {
+            g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc;
+        }
         /* Rejoin the compiled fast path only for images that HAVE lifted
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
