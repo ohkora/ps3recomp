@@ -1869,6 +1869,29 @@ static void cap_draw_signature(FILE* mf, const D3D12DrawRecord* r, u32 op, CapSi
 static void cap_kdump_begin(FILE* f, u32 capidx);
 static void cap_sig_end(void);
 
+/* A record's depth state for the manifest: its depth surface, whether it is a
+ * depth-only pass, the surface clip, and the depth/stencil test (rsx_zs_key). */
+static void cap_depth_line(FILE* mf, const D3D12DrawRecord* r)
+{
+    static const char* fn[8] = { "NEVER", "LESS", "EQUAL", "LEQUAL",
+                                 "GREATER", "NOTEQUAL", "GEQUAL", "ALWAYS" };
+    if (r->is_clear) {
+        fprintf(mf, "      depth z=0x%08X nc=%d clip=%ux%u mask=0x%02X zval=%.6f sval=%u\n",
+                r->zeta_off, r->no_color, r->rt_w, r->rt_h, r->clear_mask,
+                r->clear_z, (unsigned)r->clear_s);
+        return;
+    }
+    const u64 k = r->zs_key;
+    char zs[48];
+    if (!(k & 1u)) snprintf(zs, sizeof zs, "off");
+    else snprintf(zs, sizeof zs, "%s%s", fn[(k >> 2) & 7u], (k & 2u) ? "+write" : "");
+    fprintf(mf, "      depth z=0x%08X nc=%d clip=%ux%u zs=%s", r->zeta_off, r->no_color,
+            r->rt_w, r->rt_h, zs);
+    if (k & (1u << 5))
+        fprintf(mf, " stencil=%s ref=0x%02X", fn[(k >> 6) & 7u], r->stencil_ref & 0xFFu);
+    fprintf(mf, " cull=0x%X\n", r->cull);
+}
+
 static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
 {
     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
@@ -1905,9 +1928,12 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         for (u32 d = 0; d < ndraws && d < MAX_DRAWS; d++) {
             const D3D12DrawRecord* r = &s_d3d.draws[d];
             if (r->is_clear)
+            {
                 fprintf(mf, "op%03u CLEAR rt=0x%08X mrt=0x%X/0x%X/0x%X cc=(%.3f,%.3f,%.3f,%.3f)\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
                         r->cc[0], r->cc[1], r->cc[2], r->cc[3]);
+                cap_depth_line(mf, r);
+            }
             else {
                 fprintf(mf, "op%03u DRAW  rt=0x%08X mrt=0x%X/0x%X/0x%X vp=%u,%u,%ux%u fp=0x%08X vs=%d "
                             "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X\n",
@@ -1915,6 +1941,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                         r->vp_x, r->vp_y, r->vp_w, r->vp_h,
                         r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend, r->blend_key,
                         r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw);
+                cap_depth_line(mf, r);
                 for (int u = 0; u < VP_TEX_UNITS; u++)
                     if (r->tex[u].set)
                         fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X\n", u,
@@ -5564,6 +5591,21 @@ static void render_frame(void)
             D3D12_CPU_DESCRIPTOR_HANDLE cur_dsv = dsv_handle;
             double _rec0 = perf_on() ? perf_now() : 0.0;
             int seen_small_vp = 0, captured = 0;
+            /* RSX_DS_FRAME_CLEAR=<hex>[,<hex>...]: clear these depth surfaces to
+             * 1.0 at the start of every frame, whatever the guest clears. A test
+             * for a scene whose depth surface nothing clears: if its dark frames
+             * go with this on, they were testing against the frame before. */
+            { static u32 fz[8]; static int nfz = -1;
+              if (nfz < 0) nfz = cap_parse_list(getenv("RSX_DS_FRAME_CLEAR"), fz, 8);
+              for (int _f = 0; _f < nfz; _f++) {
+                  const int zi = off_ds_find(fz[_f]);
+                  if (zi < 0) continue;
+                  off_ds_transition(zi, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                  s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, off_ds_dsv(zi),
+                      D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+                  s_d3d.off_ds[zi].cleared = 1;
+                  s_d3d.off_ds[zi].gen++;
+              } }
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
