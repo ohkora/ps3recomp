@@ -1722,6 +1722,118 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
     rb->lpVtbl->Release(rb);
 }
 
+/* A depth surface's depth plane as ds_<offset>.bmp, and what it holds in the
+ * log: how much of it is still the clear value 1.0, how much is 0, and the
+ * range and mean of the rest. The grey runs from that range's minimum (black)
+ * to its maximum (white), so a shadow map whose depths sit close together
+ * still shows its shapes; texels at 1.0 are drawn dark blue to stand apart.
+ * Self-contained like cap_readback_write. The copy layout comes from
+ * GetCopyableFootprints for subresource 0 (the depth plane) of a resource as
+ * off_ds_get creates it; its texels are 32 bits with the depth in bits 0-23. */
+static void cap_readback_depth(const OffDS* z, u32 fi, const char* path)
+{
+    if (!z || !z->res || !z->w || !z->h) return;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = z->w; td.Height = z->h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R24G8_TYPELESS; td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; UINT rows = 0; UINT64 rowbytes = 0, total = 0;
+    memset(&fp, 0, sizeof fp);
+    s_d3d.device->lpVtbl->GetCopyableFootprints(s_d3d.device, &td, 0, 1, 0,
+                                                &fp, &rows, &rowbytes, &total);
+    if (!total || rows < z->h || rowbytes < (UINT64)z->w * 4u ||
+        fp.Footprint.RowPitch < z->w * 4u) {
+        printf("[RSXCAP] %s: depth plane layout fmt %u, %u rows of %llu bytes, pitch %u:"
+               " not read\n", path, (unsigned)fp.Footprint.Format, (unsigned)rows,
+               (unsigned long long)rowbytes, (unsigned)fp.Footprint.RowPitch);
+        return;
+    }
+
+    ID3D12Resource* rb = NULL;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = total; rd.Height = 1; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void**)&rb)) || !rb)
+        return;
+
+    wait_for_gpu();
+    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
+    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = z->res;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (z->st != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        b.Transition.StateBefore = z->st;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    src.pResource = z->res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    if (z->st != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter  = z->st;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+    ID3D12CommandList* cl[] = { (ID3D12CommandList*)s_d3d.cmd_list };
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cl);
+    wait_for_gpu();
+
+    void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)total};
+    u8* img = (u8*)malloc((size_t)z->w * z->h * 4u);
+    if (img && SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &mp)) && mp) {
+        const u8* base = (const u8*)mp + fp.Offset;
+        u64 ncl = 0, nzero = 0, nrest = 0; double sum = 0.0;
+        u32 lo = 0xFFFFFFu, hi = 0;
+        for (u32 y = 0; y < z->h; y++) {
+            const u32* row = (const u32*)(base + (u64)y * fp.Footprint.RowPitch);
+            for (u32 x = 0; x < z->w; x++) {
+                const u32 d = row[x] & 0xFFFFFFu;
+                if (d == 0xFFFFFFu) { ncl++; continue; }
+                if (d == 0) nzero++;
+                nrest++; sum += d;
+                if (d < lo) lo = d;
+                if (d > hi) hi = d;
+            }
+        }
+        const double span = hi > lo ? (double)(hi - lo) : 1.0;
+        for (u32 y = 0; y < z->h; y++) {
+            const u32* row = (const u32*)(base + (u64)y * fp.Footprint.RowPitch);
+            u8* o = img + (u64)y * z->w * 4u;
+            for (u32 x = 0; x < z->w; x++, o += 4) {
+                const u32 d = row[x] & 0xFFFFFFu;
+                if (d == 0xFFFFFFu) { o[0] = 0; o[1] = 0; o[2] = 96; o[3] = 255; continue; }
+                const double t = nrest ? ((double)d - lo) / span : 0.0;
+                const u8 g = (u8)(t * 255.0 + 0.5);
+                o[0] = g; o[1] = g; o[2] = g; o[3] = 255;
+            }
+        }
+        D3D12_RANGE wr = {0, 0};
+        rb->lpVtbl->Unmap(rb, 0, &wr);
+        const double n = (double)z->w * z->h;
+        printf("[RSXCAP] %s depth %ux%u (copy fmt %u): %.2f%% at 1.0, %.2f%% at 0;"
+               " the rest %.7f..%.7f, mean %.7f\n",
+               path, z->w, z->h, (unsigned)fp.Footprint.Format, 100.0 * ncl / n, 100.0 * nzero / n,
+               nrest ? lo / 16777215.0 : 0.0, nrest ? hi / 16777215.0 : 0.0,
+               nrest ? sum / nrest / 16777215.0 : 0.0);
+        cap_write_bmp(path, img, z->w, z->h, z->w * 4u, DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+    free(img);
+    rb->lpVtbl->Release(rb);
+}
+
 /* Is off in the RSX_CAP_ONLY list? An empty list takes everything. */
 static int cap_listed(const u32* only, int n, u32 off)
 {
@@ -1868,6 +1980,18 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         snprintf(path, sizeof path, "%s/rt_%08X.bmp", dir, r->off);
         cap_readback_write(r->res, r->w, r->h, r->dxgi, r->st, fi, path);
     }
+    /* Depth surfaces, as ds_<offset>.bmp: those RSX_CAP_ONLY names by their
+     * offset, or every one with RSX_CAP_DS=1 when the list is empty. A depth
+     * surface and the colour copy made of it share an offset, so naming it
+     * writes both (rt_ and ds_). */
+    { static int ds_all = -1;
+      if (ds_all < 0) { const char* e = getenv("RSX_CAP_DS"); ds_all = (e && *e && *e != '0') ? 1 : 0; }
+      for (int i = 0; i < MAX_OFF_DS; i++) {
+          const OffDS* z = &s_d3d.off_ds[i];
+          if (!z->res || !(nonly ? cap_listed(only, nonly, z->off) : ds_all)) continue;
+          snprintf(path, sizeof path, "%s/ds_%08X.bmp", dir, z->off);
+          cap_readback_depth(z, fi, path);
+      } }
     printf("[RSXCAP] frame %llu -> %s (%u ops)\n",
            (unsigned long long)s_d3d.frame_count, dir, ndraws);
 }
