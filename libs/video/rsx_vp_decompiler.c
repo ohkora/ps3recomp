@@ -30,6 +30,7 @@
  */
 #include "rsx_vp_decompiler.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- little-endian word read (RPCS3-capture native order) --------------- */
@@ -282,6 +283,21 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
     u32 input_mask, char* out, u32 out_size);
+
+/* RSX_VP_PRECISE=1 (a test): declare the position output, the registers and
+ * the position temp `precise`, so the host compiler may not fuse, reorder or
+ * otherwise reshape the math that produces the position. On the RSX two
+ * programs that compute a position with the same instructions get the same
+ * bits, and a title that lays down depth in one pass and draws colour over it
+ * with EQUAL (or LESS/LEQUAL against itself) relies on that. A host compiler
+ * that turns a MUL+ADD into an FMA in one program and not in the other breaks
+ * it by an ulp, which shows as stripes along the depth bands. */
+static int vp_precise(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_VP_PRECISE"); on = (e && *e && *e != '0') ? 1 : 0; }
+    return on;
+}
 
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 {
@@ -610,9 +626,11 @@ static int rsx_vp_decompile_impl(
         }
         emit(&o, "};\n");
     }
+    const int precise = vp_precise();
+    emit(&o, "struct VSOutput {\n");
+    emit(&o, precise ? "    precise float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
+                     : "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n");
     emit(&o,
-        "struct VSOutput {\n"
-        "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
         "    float4 fog:FOG;\n"
         "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
@@ -668,8 +686,9 @@ static int rsx_vp_decompile_impl(
             emit(&o, assignment);
         }
     }
+    emit(&o, precise ? "    precise float4 r[32]; precise float4 o[16];\n"
+                     : "    float4 r[32]; float4 o[16];\n");
     emit(&o,
-        "    float4 r[32]; float4 o[16];\n"
         "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n"
         "    [unroll] for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n"
         "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n"
@@ -685,9 +704,9 @@ static int rsx_vp_decompile_impl(
      * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7,
      * o15 = TEX8, o6 = TEX9 (RPCS3's reg_table: TEX9 shares the point-size
      * register). */
+    emit(&o, "    VSOutput Out;\n");
+    emit(&o, precise ? "    precise float4 _p = o[0];\n" : "    float4 _p = o[0];\n");
     emit(&o,
-        "    VSOutput Out;\n"
-        "    float4 _p = o[0];\n"
         "    Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n"
         "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
