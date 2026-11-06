@@ -125,6 +125,118 @@ int main(void)
         unsetenv("RSX_FP_DEBUG");
     }
 
+    /* RSX_FP_NANTRACE=1 (or a structural hash): after every write, the first
+     * instruction that left a NaN in its destination is remembered, and a
+     * NaN colour comes out as the magenta mark carrying its number. Read on
+     * every decompile, so these can run anywhere. */
+    {
+        u8 prog[32];
+        put_word(prog + 0, OPC(0x02) | OUTMASK_ALL | OUTREG(1));         /* MUL r1, r0, r0 */
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        unsetenv("RSX_FP_NANTRACE");
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("nantrace_off", hlsl, "_rsx_nan");
+        check_absent("nantrace_off_isnan", hlsl, "_rsx_isnan4");
+
+        setenv("RSX_FP_NANTRACE", "1", 1);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("nantrace_decl", hlsl, "    uint _rsx_nan_at = 0u;\n");
+        check("nantrace_first", hlsl,
+              "    if (_rsx_nan_at == 0u && _rsx_isnan4(r[1])) _rsx_nan_at = 1u;\n");
+        check("nantrace_second", hlsl,
+              "    if (_rsx_nan_at == 0u && _rsx_isnan4(r[0])) _rsx_nan_at = 2u;\n");
+        check("nantrace_mark", hlsl,
+              "    float4 _o = r[0];\n"
+              "    if (_rsx_isnan4(_o)) return _rsx_nan_mark(_rsx_nan_at);\n"
+              "    return (_o == _o) ? _o : (float4)0;\n}\n");
+        check("nantrace_isnan", hlsl,
+              "bool   _rsx_isnan4(float4 v) { return any((asuint(v) & 0x7FFFFFFFu) > 0x7F800000u); }\n");
+        check("nantrace_mark_fn", hlsl,
+              "float4 _rsx_nan_mark(uint k) { return float4(1.0, (float)(k & 255u) / 255.0, 1.0, 1.0); }\n");
+        /* The alpha test still patches the program's own return. */
+        check_true("nantrace_alpha",
+                   rsx_fp_apply_alpha_test(hlsl, sizeof(hlsl), 0x204u, 0.5f) == 1);
+        check("nantrace_alpha_out", hlsl,
+              "    if (_rsx_isnan4(_o)) return _rsx_nan_mark(_rsx_nan_at);\n"
+              "    float4 _rsx_out = (_o == _o) ? _o : (float4)0;\n");
+
+        /* By structural hash: that program, and no other. */
+        char spec[32];
+        snprintf(spec, sizeof spec, "%llx", (unsigned long long)
+                 rsx_fp_structural_hash(prog, sizeof prog, 1469598103934665603ull));
+        setenv("RSX_FP_NANTRACE", spec, 1);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("nantrace_by_hash", hlsl, "return _rsx_nan_mark(_rsx_nan_at);");
+        rsx_fp_decompile(prog + 16, 16, CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("nantrace_other_program", hlsl, "_rsx_nan");
+
+        /* Two colour targets: each one is marked on its own. */
+        u8 mrt[32];
+        put_word(mrt +  0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | OUTREG(0));
+        put_word(mrt +  4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(mrt +  8, 0);
+        put_word(mrt + 12, 0);
+        put_word(mrt + 16, OPC(0x01) | OUTMASK_ALL | INSRC(2) | OUTREG(2) | END);
+        put_word(mrt + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(mrt + 24, 0);
+        put_word(mrt + 28, 0);
+        setenv("RSX_FP_NANTRACE", "all", 1);
+        rsx_fp_decompile(mrt, sizeof(mrt), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("nantrace_mrt_t0", hlsl,
+              "    _out.t0 = _rsx_isnan4(_o0) ? _rsx_nan_mark(_rsx_nan_at) : (_o0 == _o0) ? _o0 : (float4)0;\n");
+        check("nantrace_mrt_t1", hlsl,
+              "    _out.t1 = _rsx_isnan4(_o1) ? _rsx_nan_mark(_rsx_nan_at) : (_o1 == _o1) ? _o1 : (float4)0;\n");
+        setenv("RSX_FP_NANTRACE", "0", 1);
+        rsx_fp_decompile(mrt, sizeof(mrt), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("nantrace_zero_is_off", hlsl, "_rsx_nan");
+        unsetenv("RSX_FP_NANTRACE");
+    }
+
+    /* RSX_FP_LEGACY_MUL=1: the products of MUL, MAD, DP2/3/4, NRM, DIV and LRP
+     * follow "0 times anything is 0". Off, they are plain IEEE products. */
+    {
+        static const struct { u32 op; const char* name; const char* expect; } lm[] = {
+            { 0x02, "lmul_mul", "_rsx_lmul(((r[0]).xyzw), ((r[1]).xyzw))" },
+            { 0x04, "lmul_mad", "_rsx_lmul(((r[0]).xyzw), ((r[1]).xyzw)) + ((r[2]).xyzw)" },
+            { 0x05, "lmul_dp3", "_rsx_ldot3(((r[0]).xyzw), ((r[1]).xyzw))" },
+            { 0x06, "lmul_dp4", "_rsx_ldot4(((r[0]).xyzw), ((r[1]).xyzw))" },
+            { 0x38, "lmul_dp2", "_rsx_ldot2(((r[0]).xyzw), ((r[1]).xyzw))" },
+            { 0x39, "lmul_nrm", "_rsx_lnrm(((r[0]).xyzw))" },
+            { 0x3A, "lmul_div", "_rsx_lmul(((r[0]).xyzw), (float4)(1.0 / ((r[1]).xyzw).x))" },
+            { 0x1F, "lmul_lrp", "_rsx_llrp(((r[0]).xyzw), ((r[1]).xyzw), ((r[2]).xyzw))" },
+        };
+        u8 prog[16];
+        setenv("RSX_FP_LEGACY_MUL", "1", 1);
+        for (size_t i = 0; i < sizeof lm / sizeof lm[0]; i++) {
+            put_word(prog + 0, OPC(lm[i].op) | OUTMASK_ALL | OUTREG(3) | END);
+            put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+            put_word(prog + 8, T_TEMP | REG(1) | SWZ_IDENT);
+            put_word(prog + 12, T_TEMP | REG(2) | SWZ_IDENT);
+            rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+            check(lm[i].name, hlsl, lm[i].expect);
+        }
+        check("lmul_helper", hlsl,
+              "float4 _rsx_lmul(float4 a, float4 b) { return ((asuint(a) & 0x7FFFFFFFu) == 0u"
+              " || (asuint(b) & 0x7FFFFFFFu) == 0u) ? (float4)0.0 : a * b; }\n");
+        check("lmul_lrp_helper", hlsl,
+              "float4 _rsx_llrp(float4 a, float4 b, float4 c) { return _rsx_lmul(a, b) + _rsx_lmul(1.0 - a, c); }\n");
+        /* An ADD has no product: no helpers. */
+        put_word(prog + 0, OPC(0x03) | OUTMASK_ALL | OUTREG(3) | END);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("lmul_add_plain", hlsl, "_rsx_lmul");
+        unsetenv("RSX_FP_LEGACY_MUL");
+        put_word(prog + 0, OPC(0x02) | OUTMASK_ALL | OUTREG(3) | END);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("lmul_off", hlsl, "((r[0]).xyzw) * ((r[1]).xyzw)");
+        check_absent("lmul_off_helper", hlsl, "_rsx_lmul");
+    }
+
     /* Test 1: MOV r0, COL0  (write all, END). */
     {
         u8 prog[16];

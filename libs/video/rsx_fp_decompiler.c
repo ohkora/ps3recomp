@@ -701,6 +701,31 @@ static int rsx_fp_decompile_internal(
     int dbg_done = 0;
     if (dbg_here) out_puts(&o, "    float4 _rsx_dbg = (float4)0;\n");
 
+    /* RSX_FP_NANTRACE=1 (every program) or =<structural hash hex> (that
+     * program only): a pixel whose colour comes out NaN, which the export
+     * guard below turns into 0 (black), is written as (1, k/255, 1, 1)
+     * instead: magenta, with k the first instruction (counted from 1 as
+     * RSX_FP_DEBUG counts them) that left a NaN in its destination register.
+     * NaN is tested on the bits, which FXC cannot fold away the way it may
+     * fold x != x. A program whose output is never NaN draws as before. */
+    int nan_trace = 0;
+    { const char* e = getenv("RSX_FP_NANTRACE");
+      if (e && *e && strcmp(e, "0")) {
+          if (!strcmp(e, "1") || !strcmp(e, "all")) nan_trace = 1;
+          else nan_trace = strtoull(e, NULL, 16) ==
+              rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull);
+      } }
+    /* RSX_FP_LEGACY_MUL=1: MUL, MAD, DP2/DP3/DP4, NRM, DIV and LRP multiply
+     * with the D3D9-era rule that 0 times anything, an infinity or a NaN
+     * included, is 0, where IEEE (and so D3D12) gives NaN for 0 * inf. An
+     * experiment: whether the RSX multiplies this way is what it tests. */
+    int legacy_mul = 0;
+    { const char* e = getenv("RSX_FP_LEGACY_MUL");
+      legacy_mul = e && *e && strcmp(e, "0") != 0; }
+    int uses_lmul = 0;   /* the preamble gets the legacy multiply helpers */
+    u32 insn_no = 0;     /* handled instructions so far (RSX_FP_NANTRACE) */
+    if (nan_trace) out_puts(&o, "    uint _rsx_nan_at = 0u;\n");
+
     /* Which colour export each register file received a write to, indexed
      * [half][target]. The whole file is tracked, not just target 0, because
      * the highest one written decides how many SV_TARGETs come out. */
@@ -896,11 +921,19 @@ static int rsx_fp_decompile_internal(
         switch (opcode) {
         case OP_NOP: rhs[0] = '\0'; handled = 0; break;
         case OP_MOV: snprintf(rhs, sizeof(rhs), "%s", a); break;
-        case OP_MUL: snprintf(rhs, sizeof(rhs), "(%s) * (%s)", a, b); break;
+        case OP_MUL:
+            if (legacy_mul) { uses_lmul = 1; snprintf(rhs, sizeof(rhs), "_rsx_lmul((%s), (%s))", a, b); break; }
+            snprintf(rhs, sizeof(rhs), "(%s) * (%s)", a, b); break;
         case OP_ADD: snprintf(rhs, sizeof(rhs), "(%s) + (%s)", a, b); break;
-        case OP_MAD: snprintf(rhs, sizeof(rhs), "(%s) * (%s) + (%s)", a, b, c); break;
-        case OP_DP3: snprintf(rhs, sizeof(rhs), "dot((%s).xyz, (%s).xyz)", a, b); break;
-        case OP_DP4: snprintf(rhs, sizeof(rhs), "dot((%s), (%s))", a, b); break;
+        case OP_MAD:
+            if (legacy_mul) { uses_lmul = 1; snprintf(rhs, sizeof(rhs), "_rsx_lmul((%s), (%s)) + (%s)", a, b, c); break; }
+            snprintf(rhs, sizeof(rhs), "(%s) * (%s) + (%s)", a, b, c); break;
+        case OP_DP3:
+            if (legacy_mul) { uses_lmul = 1; snprintf(rhs, sizeof(rhs), "_rsx_ldot3((%s), (%s))", a, b); break; }
+            snprintf(rhs, sizeof(rhs), "dot((%s).xyz, (%s).xyz)", a, b); break;
+        case OP_DP4:
+            if (legacy_mul) { uses_lmul = 1; snprintf(rhs, sizeof(rhs), "_rsx_ldot4((%s), (%s))", a, b); break; }
+            snprintf(rhs, sizeof(rhs), "dot((%s), (%s))", a, b); break;
         case OP_MIN: snprintf(rhs, sizeof(rhs), "min((%s), (%s))", a, b); break;
         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
@@ -931,7 +964,9 @@ static int rsx_fp_decompile_internal(
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
         case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
-        case OP_DIV: snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
+        case OP_DIV:
+            if (legacy_mul) { uses_lmul = 1; snprintf(rhs, sizeof(rhs), "_rsx_lmul((%s), (float4)(1.0 / (%s).x))", a, b); break; }
+            snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
         /* Real RSX DIVSQ shares RSQ's sign-ignoring sqrt on the denominator
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp's _builtin_sqrt macro,
          * reused by _builtin_divsq) AND forces the result to exactly 0,
@@ -947,9 +982,15 @@ static int rsx_fp_decompile_internal(
                      "(abs(%s) > 0.0 ? (%s) / sqrt(abs((%s).x)) : (float4)0.0)",
                      a, a, b);
             break;
-        case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
-        case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
-        case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
+        case OP_DP2:
+            if (legacy_mul) { uses_lmul = 1; snprintf(rhs, sizeof(rhs), "_rsx_ldot2((%s), (%s))", a, b); break; }
+            snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
+        case OP_NRM:
+            if (legacy_mul) { uses_lmul = 1; snprintf(rhs, sizeof(rhs), "_rsx_lnrm((%s))", a); break; }
+            snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
+        case OP_LRP:
+            if (legacy_mul) { uses_lmul = 1; snprintf(rhs, sizeof(rhs), "_rsx_llrp((%s), (%s), (%s))", a, b, c); break; }
+            snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
         /* Lighting coefficients: (1, y, y > 0 ? 2^w : 0, 1) (RPCS3
          * FragmentProgramDecompiler, RSX_FP_OPCODE_LIF). */
         case OP_LIF:
@@ -1084,6 +1125,7 @@ static int rsx_fp_decompile_internal(
 
         int has_dest = !(w0 & FP_OUT_NONE);
         if (dbg_here && handled && !dbg_done) dbg_count++;
+        if (handled) insn_no++;
         if (handled && (has_dest || set_cond)) {
             u32 dst_idx = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
             int dst_half = (w0 & FP_OUT_HALF) ? 1 : 0;
@@ -1164,6 +1206,13 @@ static int rsx_fp_decompile_internal(
                 const int target = fp_export_target(dst_idx, dst_half);
                 if (target >= 0) wrote[dst_half][target] = 1;
             }
+            if (nan_trace && has_dest) {
+                char line[192];
+                snprintf(line, sizeof(line),
+                         "    if (_rsx_nan_at == 0u && _rsx_isnan4(%s[%u])) _rsx_nan_at = %uu;\n",
+                         reg, dst_idx, insn_no);
+                out_puts(&o, line);
+            }
         }
 
         if (w0 & FP_END) break;
@@ -1219,10 +1268,12 @@ static int rsx_fp_decompile_internal(
                          " r[0] = _d; h[0] = _d; }\n");
     }
     if (targets == 1 && !depth_export) {
-        char tail[96];
+        char tail[256];
         snprintf(tail, sizeof(tail),
                  "    float4 _o = %s[0];\n"
-                 "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file);
+                 "%s"
+                 "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file,
+                 nan_trace ? "    if (_rsx_isnan4(_o)) return _rsx_nan_mark(_rsx_nan_at);\n" : "");
         out_puts(&o, tail);
     } else {
         /* Multiple render targets. The NaN guard is per target: a poisoned
@@ -1230,12 +1281,15 @@ static int rsx_fp_decompile_internal(
          * are computed independently. */
         out_puts(&o, "    PSOutput _out;\n");
         for (u32 t = 0; t < targets; t++) {
-            char line[192];
+            char sel[96] = "";
+            if (nan_trace)
+                snprintf(sel, sizeof(sel), "_rsx_isnan4(_o%u) ? _rsx_nan_mark(_rsx_nan_at) : ", t);
+            char line[320];
             snprintf(line, sizeof(line),
                      "    float4 _o%u = %s[%u];\n"
-                     "    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
+                     "    _out.t%u = %s(_o%u == _o%u) ? _o%u : (float4)0;\n",
                      t, export_file, fp_export_reg[half_exports][t],
-                     t, t, t, t);
+                     t, sel, t, t, t);
             out_puts(&o, line);
         }
         if (depth_export)
@@ -1340,6 +1394,20 @@ static int rsx_fp_decompile_internal(
         "float4 _rsx_up2h(float v) { uint u = asuint(v); return float4(f16tof32(u & 65535u), f16tof32(u >> 16), f16tof32(u & 65535u), f16tof32(u >> 16)); }\n"
         "float4 _rsx_lin2srgb(float4 cl) { cl = saturate(cl); float4 low = cl * 12.92; float4 high = 1.055 * pow(cl, 1.0 / 2.4) - 0.055; return saturate((cl < 0.0031308) ? low : high); }\n"
         "float4 _rsx_srgb2lin(float4 cs) { float4 a = cs / 12.92; float4 b = pow(max(cs + 0.055, 0.0) / 1.055, 2.4); return (cs > 0.04045) ? b : a; }\n");
+    if (nan_trace) out_puts(&p,
+        "bool   _rsx_isnan4(float4 v) { return any((asuint(v) & 0x7FFFFFFFu) > 0x7F800000u); }\n"
+        "float4 _rsx_nan_mark(uint k) { return float4(1.0, (float)(k & 255u) / 255.0, 1.0, 1.0); }\n");
+    /* RSX_FP_LEGACY_MUL: 0 times anything is 0. The zero test is on the bits
+     * (either sign), so FXC cannot reason it away; the selects are per
+     * component. NRM is v * rsqrt(v.v) with that product, so NRM of a zero
+     * vector is 0; DIV is a * (1 / b), so 0 / 0 is 0; LRP is a*b + (1-a)*c. */
+    if (uses_lmul) out_puts(&p,
+        "float4 _rsx_lmul(float4 a, float4 b) { return ((asuint(a) & 0x7FFFFFFFu) == 0u || (asuint(b) & 0x7FFFFFFFu) == 0u) ? (float4)0.0 : a * b; }\n"
+        "float  _rsx_ldot2(float4 a, float4 b) { float4 m = _rsx_lmul(a, b); return m.x + m.y; }\n"
+        "float  _rsx_ldot3(float4 a, float4 b) { float4 m = _rsx_lmul(a, b); return m.x + m.y + m.z; }\n"
+        "float  _rsx_ldot4(float4 a, float4 b) { float4 m = _rsx_lmul(a, b); return m.x + m.y + m.z + m.w; }\n"
+        "float4 _rsx_lnrm(float4 v) { float4 s = (float4)rsqrt(_rsx_ldot3(v, v)); return float4(_rsx_lmul(v, s).xyz, 1.0); }\n"
+        "float4 _rsx_llrp(float4 a, float4 b, float4 c) { return _rsx_lmul(a, b) + _rsx_lmul(1.0 - a, c); }\n");
     if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
