@@ -475,6 +475,47 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
       if(_rt){ static int _m=0; if(PS3_LOG_FIRST(_m, _rt)) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* RSX_ZTRACE=<s>[:<n>]: a window trace for a pass deep into a run, where
+     * RSX_TRACE never reaches. From the first draw <s> seconds after the first
+     * method, print the next <n> methods (default 8000) as
+     *   [ztrace] d<draw> 0x<method> 0x<data>
+     * with d counting draws (BEGIN_END begins) from there. Vertex-program words,
+     * transform constants and inline vertex data are left out: they are most of
+     * the stream and say nothing about a pass's state. A method replayed into
+     * another state object (the FIFO resync) is marked "r". */
+    { static int on = -1; static unsigned long long t0 = 0, at = 0;
+      static u32 left = 0, draw = 0; static const rsx_state* s_main = NULL;
+      extern unsigned long long ps3_ms_now(void);
+      if (on < 0) {
+          const char* e = getenv("RSX_ZTRACE");
+          on = 0;
+          if (e && *e) {
+              char* end;
+              const double sec = strtod(e, &end);
+              left = (*end == ':') ? (u32)strtoul(end + 1, NULL, 10) : 0u;
+              if (!left) left = 8000u;
+              at = (unsigned long long)(sec * 1000.0);
+              t0 = ps3_ms_now();
+              s_main = state;
+              on = 1;
+          }
+      }
+      if (on == 1 && method == NV4097_SET_BEGIN_END && data != 0 && ps3_ms_now() - t0 >= at)
+          on = 2;
+      if (on == 2 && left) {
+          const int bulky =
+              (method >= NV4097_SET_TRANSFORM_PROGRAM && method < NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) ||
+              method == NV4097_SET_TRANSFORM_PROGRAM_LOAD || method == NV4097_SET_TRANSFORM_CONSTANT_LOAD ||
+              (method >= NV4097_SET_TRANSFORM_CONSTANT &&
+               method < NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) ||
+              method == 0x1818;   /* NV4097_INLINE_ARRAY */
+          if (method == NV4097_SET_BEGIN_END && data != 0 && state == s_main) draw++;
+          if (!bulky) {
+              left--;
+              fprintf(stderr, "[ztrace] d%u%s 0x%04X 0x%08X\n", draw, state == s_main ? "" : " r",
+                      method, data);
+          }
+      } }
     /* Vertex-program constants and microcode are most of a frame's method
      * stream (God of War HD: about 140k constant vec4s and 70k microcode
      * headers a second), and their handlers sat behind every check below.
