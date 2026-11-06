@@ -478,11 +478,46 @@ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
     return units;
 }
 
+/* RSX_SHADOW_DBG=<unit>[:<call>]: the comparison helper of that unit keeps,
+ * from its <call>-th use in a fragment (0 = the first tap), the lookup's uv,
+ * its unclamped reference and the stored depth at the texel uv falls in, as
+ * float4(u, v, reference, depth) in the program-global _rsx_sdbg<unit>.
+ * FP_SHOW can then display any of them, e.g.
+ *   FP_SHOW=float3(_rsx_sdbg1.x, _rsx_sdbg1.y, saturate((1.0 - _rsx_sdbg1.w) * 40.0))
+ * A shadow lookup that finds nothing is otherwise a guess between wrong
+ * coordinates, a wrong reference and an empty map; registers the program
+ * reuses after its taps cannot be shown at its output. */
+static int fp_shadow_dbg(u32 unit, u32* call)
+{
+    static int unit_on = -2;
+    static u32 at = 0;
+    if (unit_on == -2) {
+        unit_on = -1;
+        const char* e = getenv("RSX_SHADOW_DBG");
+        if (e && *e >= '0' && *e <= '9') {
+            char* d;
+            const long u = strtol(e, &d, 10);
+            if (u >= 0 && u < 16) unit_on = (int)u;
+            if (*d == ':') at = (u32)strtoul(d + 1, NULL, 10);
+        }
+    }
+    *call = at;
+    return unit_on == (int)unit;
+}
+
 static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
                               const rsx_fp_shadow_desc* d)
 {
     char tex[32], text[4096];
     snprintf(tex, sizeof tex, cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", unit);
+    u32 dbg_call = 0;
+    const int dbg = fp_shadow_dbg(unit, &dbg_call);
+    if (dbg) {
+        snprintf(text, sizeof text,
+            "static float4 _rsx_sdbg%u = (float4)0;\n"
+            "static uint _rsx_sdbgn%u = 0;\n", unit, unit);
+        out_puts(p, text);
+    }
     /* The RSX compares the stored depth with the reference (depth FUNC reference), the reverse of
      * the ARB_shadow order (reference FUNC depth). See docs/SHADOW_COMPARISON.md. */
     const char* cmp[] = { "0.0", "depth < reference", "depth == reference",
@@ -501,6 +536,15 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     }
     out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
                                      "    float2 uv = coordinate.xy;\n");
+    if (dbg) {
+        snprintf(text, sizeof text,
+            "    if (_rsx_sdbgn%u++ == %uu) {\n"
+            "        uint dw, dh; %s.GetDimensions(dw, dh);\n"
+            "        int2 t = clamp(int2(floor(uv * float2(dw, dh))), int2(0, 0), int2(dw, dh) - 1);\n"
+            "        _rsx_sdbg%u = float4(uv, coordinate.z, %s.Load(int3(t, 0)).r);\n"
+            "    }\n", unit, dbg_call, tex, unit, tex);
+        out_puts(p, text);
+    }
     if (!d->linear) {
         snprintf(text, sizeof text,
             "    float depth = %s.SampleLevel(rsx_samp[%u], uv, 0.0).r;\n"
