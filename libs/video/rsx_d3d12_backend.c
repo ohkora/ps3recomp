@@ -5138,6 +5138,16 @@ static void render_frame(void)
      * texture can resolve to it below, whatever the op order). Depth surfaces
      * too, and the colour copy of each one a draw samples: both settle their
      * size here, before any draw's SRV window points at them. */
+    /* RSX_ZWRITE_ZETA=<hex>[,<hex>...]: a test. Draws over one of these depth
+     * surfaces that test depth also write it, whatever the guest's depth mask:
+     * do a pass's draws fill the surface once they may? */
+    { static u32 wz[8]; static int nwz = -1;
+      if (nwz < 0) nwz = cap_parse_list(getenv("RSX_ZWRITE_ZETA"), wz, 8);
+      for (u32 _d = 0; nwz > 0 && _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+          D3D12DrawRecord* dr = &s_d3d.draws[_d];
+          if (dr->is_vp && !dr->is_clear && (dr->zs_key & 1u) && cap_listed(wz, nwz, dr->zeta_off))
+              dr->zs_key |= 2u;
+      } }
     /* RSX_DEPTH_ONLY_ZETA=<hex>[,<hex>...]: a test. A draw over one of these
      * depth surfaces that leaves its colour target on a display buffer and masks
      * every colour write is drawn as a depth-only pass into that surface, sized
