@@ -156,6 +156,7 @@ typedef struct {
     u32 rt_w, rt_h;     /* surface clip dims at record time (offscreen RT size) */
     u32 rt_fmt;         /* RSX surface colour format (SET_SURFACE_FORMAT [4:0]) */
     u32 zeta_off;       /* depth surface (SET_SURFACE_ZETA_OFFSET) when the surface has one */
+    u32 clip_w, clip_h; /* surface clip at record time, also for a display target (rt_w/rt_h are 0 there) */
     int no_color;       /* colour target NONE with a depth surface: a depth-only pass */
     int tex_ds[VP_TEX_UNITS];   /* pre-pass: OffDS read through unit u (its colour copy is tex_rt), -1 = none */
     int tex_dz[VP_TEX_UNITS];   /* pre-pass: OffDS a depth-format unit u reads directly, -1 = none */
@@ -1870,14 +1871,15 @@ static void cap_kdump_begin(FILE* f, u32 capidx);
 static void cap_sig_end(void);
 
 /* A record's depth state for the manifest: its depth surface, whether it is a
- * depth-only pass, the surface clip, and the depth/stencil test (rsx_zs_key). */
+ * depth-only pass, the surface clip and the size the pass binds (0x0 for a
+ * display target), and the depth/stencil test (rsx_zs_key). */
 static void cap_depth_line(FILE* mf, const D3D12DrawRecord* r)
 {
     static const char* fn[8] = { "NEVER", "LESS", "EQUAL", "LEQUAL",
                                  "GREATER", "NOTEQUAL", "GEQUAL", "ALWAYS" };
     if (r->is_clear) {
-        fprintf(mf, "      depth z=0x%08X nc=%d clip=%ux%u mask=0x%02X zval=%.6f sval=%u\n",
-                r->zeta_off, r->no_color, r->rt_w, r->rt_h, r->clear_mask,
+        fprintf(mf, "      depth z=0x%08X nc=%d clip=%ux%u rtsz=%ux%u mask=0x%02X zval=%.6f sval=%u\n",
+                r->zeta_off, r->no_color, r->clip_w, r->clip_h, r->rt_w, r->rt_h, r->clear_mask,
                 r->clear_z, (unsigned)r->clear_s);
         return;
     }
@@ -1885,8 +1887,8 @@ static void cap_depth_line(FILE* mf, const D3D12DrawRecord* r)
     char zs[48];
     if (!(k & 1u)) snprintf(zs, sizeof zs, "off");
     else snprintf(zs, sizeof zs, "%s%s", fn[(k >> 2) & 7u], (k & 2u) ? "+write" : "");
-    fprintf(mf, "      depth z=0x%08X nc=%d clip=%ux%u zs=%s", r->zeta_off, r->no_color,
-            r->rt_w, r->rt_h, zs);
+    fprintf(mf, "      depth z=0x%08X nc=%d clip=%ux%u rtsz=%ux%u zs=%s", r->zeta_off, r->no_color,
+            r->clip_w, r->clip_h, r->rt_w, r->rt_h, zs);
     if (k & (1u << 5))
         fprintf(mf, " stencil=%s ref=0x%02X", fn[(k >> 6) & 7u], r->stencil_ref & 0xFFu);
     fprintf(mf, " cull=0x%X\n", r->cull);
@@ -4050,7 +4052,10 @@ static void rec_zeta(D3D12DrawRecord* dr)
     const rsx_state* st = s_d3d.current_rsx_state;
     dr->zeta_off = 0;
     dr->no_color = 0;
-    if (!st || !((st->surface_format >> 5) & 7u)) return;
+    if (!st) return;
+    dr->clip_w = st->surface_clip_w;
+    dr->clip_h = st->surface_clip_h;
+    if (!((st->surface_format >> 5) & 7u)) return;
     dr->zeta_off = st->surface_zeta_offset;
     dr->no_color = st->color_target == 0 && dr->zeta_off != 0;
 }
@@ -5133,6 +5138,23 @@ static void render_frame(void)
      * texture can resolve to it below, whatever the op order). Depth surfaces
      * too, and the colour copy of each one a draw samples: both settle their
      * size here, before any draw's SRV window points at them. */
+    /* RSX_DEPTH_ONLY_ZETA=<hex>[,<hex>...]: a test. A draw over one of these
+     * depth surfaces that leaves its colour target on a display buffer and masks
+     * every colour write is drawn as a depth-only pass into that surface, sized
+     * from the surface clip, instead of into the shared depth buffer. */
+    { static u32 dz[8]; static int ndz = -1;
+      if (ndz < 0) ndz = cap_parse_list(getenv("RSX_DEPTH_ONLY_ZETA"), dz, 8);
+      for (u32 _d = 0; ndz > 0 && _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+          D3D12DrawRecord* dr = &s_d3d.draws[_d];
+          if (!dr->is_vp || dr->is_clear || dr->no_color || dr->rt_off || dr->rt_mrt[0] ||
+              dr->cmask || !cap_listed(dz, ndz, dr->zeta_off))
+              continue;
+          if (dr->clip_w < 16 || dr->clip_w > 4096 || dr->clip_h < 16 || dr->clip_h > 4096)
+              continue;
+          dr->no_color = 1;
+          dr->rt_w = dr->clip_w;
+          dr->rt_h = dr->clip_h;
+      } }
     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
