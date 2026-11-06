@@ -5954,6 +5954,42 @@ static void d3d12_present(void* ud, u32 buffer_id)
     }
 }
 
+/* The depth/stencil part of a clear whose colour target is a display buffer.
+ * Display draws share one depth buffer, so the clear lands there and nowhere
+ * else -- but the guest's zeta surface can also be the depth of offscreen
+ * passes, which bind their own depth surface for it. A title that clears
+ * colour and depth on its display surface and then draws its scene into an
+ * offscreen target over the same zeta (PlayStation All-Stars Battle Royale)
+ * clears that depth surface only this way; dropping it left the scene
+ * testing every frame against the depth of the frame before. With LESS that
+ * fails wherever nothing moved closer since then: its tutorial went dark
+ * whenever the camera stood still, and lit while it moved in.
+ * So record that part again, as a depth-only clear of the zeta's own depth
+ * surface, in order with the draws. Only when a pass has made one: a title
+ * that never draws offscreen over this zeta keeps exactly what it had.
+ * RSX_DISPLAY_ZCLEAR=0 turns it off. */
+static void rec_display_zclear(u32 flags, float depth, u8 stencil)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_DISPLAY_ZCLEAR"); on = !(e && *e == '0'); }
+    if (!on || !(flags & 0x3u) || s_d3d.draw_count >= MAX_DRAWS) return;
+    D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
+    memset(dr, 0, sizeof(*dr));
+    rec_zeta(dr);
+    if (!dr->zeta_off || off_ds_find(dr->zeta_off) < 0) return;
+    dr->no_color = 1;   /* binds the zeta's depth surface, and no colour target */
+    dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1;
+    dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+    dr->clear_mask = flags & 0x3u;
+    dr->clear_z = depth;
+    dr->clear_s = stencil;
+    s_d3d.draw_count++;
+    { static int n = 0;
+      if (PS3_LOG_FIRST(n, 4))
+          printf("[D3D12] display clear 0x%X: depth part also clears depth surface 0x%08X\n",
+                 flags, dr->zeta_off); }
+}
+
 static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 {
     (void)ud;
@@ -5995,11 +6031,13 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
             dr->clear_mask = flags;
             dr->clear_z = depth;
             dr->clear_s = stencil;
+            if (rt == 0 && !dr->no_color) rec_display_zclear(flags, depth, stencil);
         }
         return;
     }
 
     memcpy(s_d3d.clear_color, cc, sizeof(cc));
+    rec_display_zclear(flags, depth, stencil);
 
     /* A DISPLAY clear marks the start of a new visible frame. If a completed
      * frame is still accumulated (the drain gulped across a frame boundary --
