@@ -5349,16 +5349,21 @@ static void render_frame(void)
                     const int ds = dr->tex_ds[_u];
                     if (ds < 0 || s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)
                         continue;
-                    /* A draw that writes the depth surface it samples reads a
-                     * feedback loop, so its copy is left as it is rather than
-                     * made again before each such draw. Every other draw gets a
-                     * fresh copy. The test was against cur_z, which here is still
-                     * the PREVIOUS draw's depth surface, so the first draw after
-                     * the pass that wrote it read an old copy. */
+                    /* A draw that writes the depth of the surface it samples
+                     * reads a feedback loop, so its copy is left as it is
+                     * rather than made again before each such draw. Every
+                     * other draw gets a fresh copy. The test was against cur_z,
+                     * which here is still the PREVIOUS draw's depth surface, so
+                     * the first draw after the pass that wrote it read an old
+                     * copy. Only a depth write counts: a draw that merely tests
+                     * stencil (a full-screen pass limited to marked pixels)
+                     * was skipped too, and read whatever the copy last held --
+                     * PlayStation All-Stars' shadow quad decoded its scene
+                     * depth from that and looked up its shadow map off the map. */
                     if (own_z == -2)
                         own_z = (dr->zeta_off && (dr->rt_off || dr->no_color))
                               ? off_ds_find(dr->zeta_off) : -1;
-                    if (ds == own_z && (dr->zs_key & (2u | (1u << 5))))
+                    if (ds == own_z && (dr->zs_key & 2u))
                         continue;
                     ds_convert(ds, dr->tex_rt[_u]);
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
