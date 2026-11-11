@@ -5178,6 +5178,16 @@ static void render_frame(void)
           if (dr->is_vp && !dr->is_clear && (dr->zs_key & 1u) && cap_listed(wz, nwz, dr->zeta_off))
               dr->zs_key |= 2u;
       } }
+    /* RSX_CULL_FLIP_ZETA=<hex>[,<hex>...]: a test. Draws over one of these depth
+     * surfaces that cull get the opposite front-face convention (CULL_FLIP for
+     * that pass alone): does a pass that culls keep the faces it should? */
+    { static u32 fz[8]; static int nfz = -1;
+      if (nfz < 0) nfz = cap_parse_list(getenv("RSX_CULL_FLIP_ZETA"), fz, 8);
+      for (u32 _d = 0; nfz > 0 && _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+          D3D12DrawRecord* dr = &s_d3d.draws[_d];
+          if (dr->is_vp && !dr->is_clear && (dr->cull & 1u) && cap_listed(fz, nfz, dr->zeta_off))
+              dr->cull ^= 4u;
+      } }
     /* RSX_DEPTH_ONLY_ZETA=<hex>[,<hex>...]: a test. A draw over one of these
      * depth surfaces that leaves its colour target on a display buffer and masks
      * every colour write is drawn as a depth-only pass into that surface, sized
