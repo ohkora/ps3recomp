@@ -989,6 +989,16 @@ static volatile u32 s_fifo_back_jumps = 0;
  * callback teleports get to begin and drops the tail the callback is waiting on. */
 static volatile int s_fifo_recycle_waiting = 0;
 
+/* The IO offsets of the title's own command ring: [*b, *e). 0 when there is
+ * no context yet or it does not map. */
+static int gcm_fifo_ring_bounds(u32* b, u32* e)
+{
+    if (!s_gcm_context_ea) return 0;
+    *b = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x0));
+    *e = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x4));
+    return *b != 0xFFFFFFFFu && *e != 0xFFFFFFFFu && *e > *b;
+}
+
 /* Bytes the walker is behind the writer. Linear while put >= get. Once the
  * title's ring wraps, put sits BEHIND get and the backlog is the rest of the
  * ring plus everything from its start to put -- nearly the whole ring, not
@@ -997,10 +1007,8 @@ static volatile int s_fifo_recycle_waiting = 0;
 static u32 gcm_fifo_backlog(u32 put, u32 get)
 {
     if (put >= get) return put - get;
-    if (!s_gcm_context_ea) return 0;
-    u32 b = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x0));
-    u32 e = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x4));
-    if (b == 0xFFFFFFFFu || e == 0xFFFFFFFFu || e <= b) return 0;
+    u32 b, e;
+    if (!gcm_fifo_ring_bounds(&b, &e)) return 0;
     if (get < b || get > e || put < b || put > e) return 0;
     return (e - get) + (put - b);
 }
@@ -1582,6 +1590,87 @@ static u32 gcm_spu_block_for_put(u32 put)
     return best;
 }
 
+/* Sweep [from, land) of a range a resync is skipping: count its flip markers,
+ * push its fences and replay its label releases (see gcm_fifo_resync_why). */
+static void gcm_fifo_resync_sweep(u32 from, u32 land)
+{
+    if (from >= land) return;
+    unsigned rescued = 0;
+    for (u32 io = from; io + 8 <= land; io += 4) {
+        u32 ea = gcm_io2ea(io); if (!ea) continue;
+        u32 w = vm_read32(ea);
+        /* A flip marker skipped here will never be reached: count it, or
+         * every flip after it waits for the drain forever. */
+        if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
+            s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; continue; }
+        if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
+        u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
+        gcm_ref_push_at(vm_read32(dea), io);
+        rescued++;
+    }
+    /* Fences are not the only sync writes a title waits on. Walk the
+     * skipped range as a command stream (each header and its data; NOPs,
+     * flip markers and self-JUMP parks stepped over, forward JUMPs inside the range
+     * followed; stopping at anything else that is not a method header) and
+     * replay the label releases in it as well: NV406E SEMAPHORE_RELEASE
+     * (0x6C, at the offset 0x64 set) and the NV4097 back-end and
+     * texture-read releases (0x1D70/0x1D74 at the 0x1D6C offset, in the
+     * 0x01A4 context), the latter through rsx_process_method so they land
+     * exactly where the walker would have written them. inFAMOUS 2 waits
+     * on a 0x1D74 release from an SPU-filled command block; a resync that
+     * skipped it left the title waiting for the rest of the run. Draws in
+     * the range are still lost. */
+    static rsx_state s_resync_state;   /* the sync methods do not touch it */
+    unsigned labels = 0;
+    for (u32 io = from; io + 4 <= land; ) {
+        const u32 ea = gcm_io2ea(io); if (!ea) break;
+        const u32 w = vm_read32(ea), type = w >> 29;
+        if (w == 0 || (w & 0xFFFFFF00u) == GCM_FLIP_MARKER) { io += 4; continue; }   /* NOP, flip (counted above) */
+        if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {   /* JUMP */
+            const u32 tgt = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
+            if (tgt == io) { io += 4; continue; }   /* a park */
+            if (tgt > io && tgt < land) { io = tgt; continue; }
+            break;
+        }
+        if (type != 0 && type != 2) break;          /* CALL, RETURN, or not a header */
+        const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
+        if (!count || io + 4 + count * 4 > land) break;
+        for (u32 i = 0; i < count; i++) {
+            const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) break;
+            const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
+            if (subch != 0) continue;
+            if (m == 0x64u) s_sema_offset = v;
+            else if (m == 0x6Cu) {
+                atomic_thread_fence(memory_order_release);
+                vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
+                labels++;
+            } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
+                rsx_process_method(&s_resync_state, m, v);
+                labels += (m == 0x1D70u || m == 0x1D74u);
+            }
+        }
+        io += 4 + count * 4;
+    }
+    if (rescued || labels) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
+        fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) and %u label"
+                " write(s) from 0x%08X..0x%08X\n", rescued, labels, from, land); }
+}
+
+/* Where the title's ring wraps: the first JUMP back to the ring's start at or
+ * after `from`, below `end`. The words after it are left over from the last
+ * lap and must not be replayed. `end` when there is none. */
+static u32 gcm_fifo_wrap_point(u32 from, u32 end, u32 begin)
+{
+    for (u32 io = from; io + 4 <= end; io += 4) {
+        const u32 ea = gcm_io2ea(io); if (!ea) break;
+        const u32 w = vm_read32(ea);
+        if (((w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == begin) ||
+            ((w & 3u) == 1u && (w & ~3u) == begin))
+            return io;
+    }
+    return end;
+}
+
 /* A resync jumps `get` straight to `put`, which is what keeps the FIFO alive
  * when the walker cannot make progress -- but everything in between is
  * dropped, and if a SET_REFERENCE is in there the cellGcmFinish waiting on it
@@ -1613,67 +1702,21 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
     /* Sweep only the range still being skipped; the walker will consume the
      * fences inside the block itself, and pushing them here too would publish
      * every one twice. */
-    u32 from = (*getoff <= land) ? *getoff : s_last_ring_off;
-    if (from < land) {
-        unsigned rescued = 0;
-        for (u32 io = from; io + 8 <= land; io += 4) {
-            u32 ea = gcm_io2ea(io); if (!ea) continue;
-            u32 w = vm_read32(ea);
-            /* A flip marker skipped here will never be reached: count it, or
-             * every flip after it waits for the drain forever. */
-            if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
-                s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; continue; }
-            if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
-            u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
-            gcm_ref_push_at(vm_read32(dea), io);
-            rescued++;
-        }
-        /* Fences are not the only sync writes a title waits on. Walk the
-         * skipped range as a command stream (each header and its data; NOPs,
-         * flip markers and self-JUMP parks stepped over, forward JUMPs inside the range
-         * followed; stopping at anything else that is not a method header) and
-         * replay the label releases in it as well: NV406E SEMAPHORE_RELEASE
-         * (0x6C, at the offset 0x64 set) and the NV4097 back-end and
-         * texture-read releases (0x1D70/0x1D74 at the 0x1D6C offset, in the
-         * 0x01A4 context), the latter through rsx_process_method so they land
-         * exactly where the walker would have written them. inFAMOUS 2 waits
-         * on a 0x1D74 release from an SPU-filled command block; a resync that
-         * skipped it left the title waiting for the rest of the run. Draws in
-         * the range are still lost. */
-        static rsx_state s_resync_state;   /* the sync methods do not touch it */
-        unsigned labels = 0;
-        for (u32 io = from; io + 4 <= land; ) {
-            const u32 ea = gcm_io2ea(io); if (!ea) break;
-            const u32 w = vm_read32(ea), type = w >> 29;
-            if (w == 0 || (w & 0xFFFFFF00u) == GCM_FLIP_MARKER) { io += 4; continue; }   /* NOP, flip (counted above) */
-            if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {   /* JUMP */
-                const u32 tgt = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
-                if (tgt == io) { io += 4; continue; }   /* a park */
-                if (tgt > io && tgt < land) { io = tgt; continue; }
-                break;
-            }
-            if (type != 0 && type != 2) break;          /* CALL, RETURN, or not a header */
-            const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
-            if (!count || io + 4 + count * 4 > land) break;
-            for (u32 i = 0; i < count; i++) {
-                const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) break;
-                const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
-                if (subch != 0) continue;
-                if (m == 0x64u) s_sema_offset = v;
-                else if (m == 0x6Cu) {
-                    atomic_thread_fence(memory_order_release);
-                    vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
-                    labels++;
-                } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
-                    rsx_process_method(&s_resync_state, m, v);
-                    labels += (m == 0x1D70u || m == 0x1D74u);
-                }
-            }
-            io += 4 + count * 4;
-        }
-        if (rescued || labels) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
-            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) and %u label"
-                    " write(s) from 0x%08X..0x%08X\n", rescued, labels, from, land); }
+    u32 rb, re;
+    if (*getoff <= land) {
+        gcm_fifo_resync_sweep(*getoff, land);
+    } else if (gcm_fifo_ring_bounds(&rb, &re) &&
+               *getoff >= rb && *getoff < re && land >= rb && land <= re) {
+        /* The title's ring has wrapped: put is behind get. The skipped range
+         * is the rest of this lap, get up to the JUMP back to the start, and
+         * then the start of the ring up to land. Sweeping neither (the old
+         * from = s_last_ring_off sat at get, above land) lost every flip
+         * marker in it, and every later flip then waited for the drain
+         * forever. */
+        gcm_fifo_resync_sweep(*getoff, gcm_fifo_wrap_point(*getoff, re, rb));
+        gcm_fifo_resync_sweep(rb, land);
+    } else {
+        gcm_fifo_resync_sweep(s_last_ring_off, land);
     }
     *getoff = land;
 }
