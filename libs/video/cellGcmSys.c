@@ -116,6 +116,12 @@ static u32 s_current_display_buffer_id = 0;
 static volatile int s_flip_pending = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
+/* Where the runtime last wrote the JUMP that wraps the title's ring back to
+ * its start (gcm_flip_into_fifo, the buffer-full callback, the drain's
+ * recycle), as an IO offset; ~0u for none. A wrap resync's sweep ends there
+ * (gcm_fifo_wrap_point). */
+static u32 s_fifo_wrap_jump_io = ~0u;
+
 /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
  * those markers the drain has reached. The RSX completes a flip when it
  * executes it; until the drain reaches the marker, the flip has not happened,
@@ -1661,14 +1667,17 @@ static void gcm_fifo_resync_sweep(u32 from, u32 land)
 {
     if (from >= land) return;
     unsigned rescued = 0;
-    for (u32 io = from; io + 8 <= land; io += 4) {
+    for (u32 io = from; io + 4 <= land; io += 4) {
         u32 ea = gcm_io2ea(io); if (!ea) continue;
         u32 w = vm_read32(ea);
         /* A flip marker skipped here will never be reached: count it, or
-         * every flip after it waits for the drain forever. */
+         * every flip after it waits for the drain forever. The last word of
+         * the range counts too: gcm_flip_into_fifo writes the marker right
+         * before the JUMP that wraps the ring, which is where a wrap
+         * resync's first piece ends. */
         if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
             s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; continue; }
-        if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
+        if (io + 8 > land || (w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
         u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
         gcm_ref_push_at(vm_read32(dea), io);
         rescued++;
@@ -1742,10 +1751,20 @@ static void gcm_fifo_resync_sweep(u32 from, u32 land)
  * wrap cut the sweep short, before the frame's flip marker. A JUMP out to a
  * command block is followed back as the sweep follows it. Where the walk
  * meets a word that is not a command, the first JUMP to the start from there
- * on is taken. */
+ * on is taken.
+ *
+ * Better than either: the wrap the runtime wrote itself, when it lies ahead
+ * and is still there. The walk cannot get past a hole an SPU has yet to fill
+ * (its reserved space is not commands yet), and the word scan after it found
+ * a JUMP-like argument again, short of the frame's flip marker. */
 static u32 gcm_fifo_wrap_point(u32 from, u32 end, u32 begin)
 {
     u32 io = from;
+    if (s_fifo_wrap_jump_io != ~0u && s_fifo_wrap_jump_io >= from && s_fifo_wrap_jump_io + 4 <= end) {
+        const u32 wea = gcm_io2ea(s_fifo_wrap_jump_io);
+        u32 tgt;
+        if (wea && gcm_fifo_jump_target(vm_read32(wea), &tgt) && tgt == begin) return s_fifo_wrap_jump_io;
+    }
     while (io + 4 <= end) {
         const u32 ea = gcm_io2ea(io); if (!ea) return end;
         const u32 w = vm_read32(ea), type = w >> 29;
@@ -2995,6 +3014,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             if (io_begin != 0xFFFFFFFFu) {
                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
+                s_fifo_wrap_jump_io = gcm_ea2io(jmp_at);
                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
                 s_fifo_getoff = io_begin;                          /* get */
@@ -3075,6 +3095,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     const u32 back_jumps0 = s_fifo_back_jumps;
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+        s_fifo_wrap_jump_io = gcm_ea2io(current);
         /* The jump has to be in guest memory before `put` moves behind the
          * walker's `get`. Program order is not enough on arm64: the walker
          * may observe the new `put`, find `get` != `put`, and read the old
@@ -3321,6 +3342,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
+        s_fifo_wrap_jump_io = gcm_ea2io(cur + 4);
         vm_write32(ctx + 8, begin);
         return 1;
     }

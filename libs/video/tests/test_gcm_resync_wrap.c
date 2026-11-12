@@ -10,14 +10,16 @@
  * The walker parks near the end of the ring with put near its start. Between
  * the park and the wrap JUMP: a flip marker, a JUMP out of the ring to a block
  * that holds the next flip marker and a release and JUMPs back, a CALL to a
- * block with another release and a RETURN, an NV406E release, a method whose
- * argument reads like a JUMP to the ring's start, and after it another flip
- * marker and release. After the
+ * block with another release and a RETURN, two NV406E releases, a hole an SPU
+ * has yet to fill, a method whose argument reads like a JUMP to the ring's
+ * start, and the frame's flip marker with the runtime's wrap JUMP after it.
+ * After the
  * wrap JUMP: stale words from the last lap (an NV406E release that must NOT be
  * replayed). From the ring's start to put: a flip marker and another release.
  * The flip in the out-of-ring block is the one a title lost for good when the
  * sweep stopped at the JUMP out; the flip after the JUMP-like argument is the
- * one it lost when it took that argument for the wrap.
+ * one it lost when it took that argument for the wrap, which it did whenever
+ * an unfilled hole kept it from walking the commands up to the real wrap.
  *
  * gcc -std=gnu17 -I include -I libs/video
  *   libs/video/tests/test_gcm_resync_wrap.c -ffunction-sections
@@ -140,7 +142,7 @@ int main(void)
     check(gcm_fifo_ring_bounds(&rb, &re) && re > rb + 0x100u, "the context gives a ring");
 
     /* The tail of this lap. */
-    const u32 park = re - 0x40u;
+    const u32 park = re - 0x100u;
     u32 io = park;
     gw32(IO_ADDR + io, 0x20000000u | io); io += 4;      /* park: JUMP to itself */
     gw32(IO_ADDR + io, GCM_FLIP_MARKER | 1u); io += 4;  /* a queued flip */
@@ -161,10 +163,13 @@ int main(void)
     gw32(IO_ADDR + io, sub | 2u); io += 4;              /* CALL a block */
     io = put_method(io, 0x0064u, 0x0030u);              /* NV406E semaphore offset */
     io = put_method(io, 0x006Cu, 0x0000AAAAu);          /* NV406E semaphore release */
-    io = put_method(io, 0x1FD8u, rb | 1u);              /* data that reads as JUMP -> start */
-    gw32(IO_ADDR + io, GCM_FLIP_MARKER | 0u); io += 4;  /* the flip after it */
     io = put_method(io, 0x0064u, 0x0080u);
     io = put_method(io, 0x006Cu, 0x00008888u);
+    gw32(IO_ADDR + io, 0x20000000u | io); io += 4;      /* a hole an SPU has yet to fill, */
+    gw32(IO_ADDR + io, 0xC0800000u); io += 4;           /* its reserved space not commands yet */
+    io = put_method(io, 0x1FD8u, rb | 1u);              /* data that reads as JUMP -> start */
+    gw32(IO_ADDR + io, GCM_FLIP_MARKER | 0u); io += 4;  /* the frame's flip, */
+    s_fifo_wrap_jump_io = io;                           /* and the wrap the runtime wrote after it */
     gw32(IO_ADDR + io, 0x20000000u | rb); io += 4;      /* the wrap: JUMP to the start */
     io = put_method(io, 0x0064u, 0x0040u);              /* stale, from the last lap */
     io = put_method(io, 0x006Cu, 0x00000BADu);
@@ -190,7 +195,7 @@ int main(void)
     check(s_fifo_flips_reached == reached0 + 4u,
           "every skipped flip marker was counted (tail, out-of-ring block, head)");
     check(vm_read32(GCM_LABEL_GUEST_BASE + 0x80u) == 0x00008888u,
-          "the release after a JUMP-like argument was replayed (not taken for the wrap)");
+          "the release before an unfilled hole was replayed");
     check(vm_read32(GCM_LABEL_GUEST_BASE + 0x60u) == 0x00006666u,
           "the release in the block the tail JUMPs to was replayed");
     check(vm_read32(GCM_LABEL_GUEST_BASE + 0x70u) == 0x00007777u,
