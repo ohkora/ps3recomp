@@ -1815,6 +1815,61 @@ static u32 gcm_spu_block_for_put(u32 put)
     return best;
 }
 
+/* The sync writes a resync replays from the commands it skips (see
+ * gcm_fifo_resync_sweep): NV406E semaphore offset/release, and the NV4097
+ * back-end and texture-read releases with their offset and context. */
+static rsx_state s_resync_state;   /* the sync methods do not touch it */
+static void gcm_resync_method(u32 m, u32 v, unsigned* labels)
+{
+    if (m == 0x64u) s_sema_offset = v;
+    else if (m == 0x6Cu) {
+        atomic_thread_fence(memory_order_release);
+        vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
+        (*labels)++;
+    } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
+        rsx_process_method(&s_resync_state, m, v);
+        *labels += (m == 0x1D70u || m == 0x1D74u);
+    }
+}
+
+/* Bounds on the blocks a resync's sweep follows out of the skipped range. */
+#define GCM_RESYNC_BLOCK_HOPS  8u
+#define GCM_RESYNC_BLOCK_WORDS 0x4000u   /* 64 KB a block */
+
+/* Walk one command block a skipped range branches to, as the RSX would have:
+ * count its flip markers, push its fences, replay its sync writes. Returns
+ * the IO offset it branches on to (a JUMP's target, or `ret` at a RETURN),
+ * or ~0u when it stops otherwise: an unfilled park, a CALL, a word that is
+ * not a command, an unmapped offset, or the size bound. */
+static u32 gcm_resync_walk_block(u32 io, u32 ret, unsigned* fences, unsigned* labels, unsigned* flips)
+{
+    for (u32 n = 0; n < GCM_RESYNC_BLOCK_WORDS; ) {
+        const u32 ea = gcm_io2ea(io); if (!ea) return ~0u;
+        const u32 w = vm_read32(ea), type = w >> 29;
+        u32 tgt;
+        if (w == 0) { io += 4; n++; continue; }
+        if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
+            if (s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; (*flips)++; }
+            io += 4; n++; continue;
+        }
+        if (gcm_fifo_jump_target(w, &tgt)) return tgt == io ? ~0u : tgt;
+        if (w == 0x00020000u) return ret;           /* RETURN */
+        if ((w & 3u) == 2u) return ~0u;             /* a CALL inside: not followed */
+        if (type != 0 && type != 2) return ~0u;
+        const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
+        if (!count) return ~0u;
+        for (u32 i = 0; i < count; i++) {
+            const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) return ~0u;
+            const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
+            if (subch != 0) continue;
+            if (m == 0x0050u) { gcm_ref_push_at(v, io); (*fences)++; }
+            else gcm_resync_method(m, v, labels);
+        }
+        io += 4 + count * 4; n += 1 + count;
+    }
+    return ~0u;
+}
+
 /* Sweep [from, land) of a range a resync is skipping: count its flip markers,
  * push its fences and replay its label releases (see gcm_fifo_resync_why). */
 static void gcm_fifo_resync_sweep(u32 from, u32 land)
@@ -1844,41 +1899,52 @@ static void gcm_fifo_resync_sweep(u32 from, u32 land)
      * exactly where the walker would have written them. inFAMOUS 2 waits
      * on a 0x1D74 release from an SPU-filled command block; a resync that
      * skipped it left the title waiting for the rest of the run. Draws in
-     * the range are still lost. */
-    static rsx_state s_resync_state;   /* the sync methods do not touch it */
-    unsigned labels = 0;
+     * the range are still lost.
+     *
+     * A JUMP or CALL out of the range to a command block elsewhere is
+     * followed too (see gcm_resync_walk_block), and walking resumes where the
+     * block branches back into the range. A title that closes each frame in
+     * such a block keeps its flip there: skipped unwalked, that flip was never
+     * counted, and the title waited for it for good. */
+    unsigned labels = 0, flips = 0, hops = 0;
     for (u32 io = from; io + 4 <= land; ) {
         const u32 ea = gcm_io2ea(io); if (!ea) break;
         const u32 w = vm_read32(ea), type = w >> 29;
         if (w == 0 || (w & 0xFFFFFF00u) == GCM_FLIP_MARKER) { io += 4; continue; }   /* NOP, flip (counted above) */
-        if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {   /* JUMP */
-            const u32 tgt = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
+        u32 tgt;
+        if (gcm_fifo_jump_target(w, &tgt)) {
             if (tgt == io) { io += 4; continue; }   /* a park */
             if (tgt > io && tgt < land) { io = tgt; continue; }
+            if (tgt >= from && tgt < land) break;   /* backwards inside the range */
+            u32 back = tgt;                         /* out to a block: follow it */
+            while (back != ~0u && (back < from || back >= land) && hops < GCM_RESYNC_BLOCK_HOPS) {
+                hops++;
+                back = gcm_resync_walk_block(back, ~0u, &rescued, &labels, &flips);
+            }
+            if (back != ~0u && back > io && back < land) { io = back; continue; }
             break;
         }
-        if (type != 0 && type != 2) break;          /* CALL, RETURN, or not a header */
+        if ((w & 3u) == 2u) {                       /* CALL: offset | 2 */
+            if (hops >= GCM_RESYNC_BLOCK_HOPS) break;
+            hops++;
+            if (gcm_resync_walk_block(w & 0x1FFFFFFCu, io + 4, &rescued, &labels, &flips) != io + 4) break;
+            io += 4;
+            continue;
+        }
+        if (type != 0 && type != 2) break;          /* RETURN, or not a header */
         const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
         if (!count || io + 4 + count * 4 > land) break;
         for (u32 i = 0; i < count; i++) {
             const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) break;
-            const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
-            if (subch != 0) continue;
-            if (m == 0x64u) s_sema_offset = v;
-            else if (m == 0x6Cu) {
-                atomic_thread_fence(memory_order_release);
-                vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
-                labels++;
-            } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
-                rsx_process_method(&s_resync_state, m, v);
-                labels += (m == 0x1D70u || m == 0x1D74u);
-            }
+            if (subch == 0)
+                gcm_resync_method((type == 0) ? method + i * 4 : method, vm_read32(dea), &labels);
         }
         io += 4 + count * 4;
     }
-    if (rescued || labels) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
+    if (rescued || labels || flips) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
         fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) and %u label"
-                " write(s) from 0x%08X..0x%08X\n", rescued, labels, from, land); }
+                " write(s) from 0x%08X..0x%08X (%u flip(s) in %u block(s) it branches to)\n",
+                rescued, labels, from, land, flips, hops); }
 }
 
 /* Where the title's ring wraps: the first JUMP back to the ring's start at or

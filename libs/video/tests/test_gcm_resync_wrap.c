@@ -8,9 +8,13 @@
  * was never counted, and every later flip waited for the drain forever.
  *
  * The walker parks near the end of the ring with put near its start. Between
- * the park and the wrap JUMP: a flip marker and an NV406E release. After the
- * JUMP: stale words from the last lap (an NV406E release that must NOT be
+ * the park and the wrap JUMP: a flip marker, a JUMP out of the ring to a block
+ * that holds the next flip marker and a release and JUMPs back, a CALL to a
+ * block with another release and a RETURN, and an NV406E release. After the
+ * wrap JUMP: stale words from the last lap (an NV406E release that must NOT be
  * replayed). From the ring's start to put: a flip marker and another release.
+ * The flip in the out-of-ring block is the one a title lost for good when the
+ * sweep stopped at the JUMP out.
  *
  * gcc -std=gnu17 -I include -I libs/video
  *   libs/video/tests/test_gcm_resync_wrap.c -ffunction-sections
@@ -141,6 +145,21 @@ int main(void)
     u32 io = park;
     gw32(IO_ADDR + io, 0x20000000u | io); io += 4;      /* park: JUMP to itself */
     gw32(IO_ADDR + io, GCM_FLIP_MARKER | 1u); io += 4;  /* a queued flip */
+    const u32 blk = 0x00080000u, sub = 0x00090000u;     /* blocks outside the ring */
+    gw32(IO_ADDR + io, 0x20000000u | blk); io += 4;     /* out to a block ... */
+    const u32 back = io;
+    {
+        u32 b = blk;
+        gw32(IO_ADDR + b, GCM_FLIP_MARKER | 0u); b += 4; /* ... that closes a frame */
+        b = put_method(b, 0x0064u, 0x0060u);
+        b = put_method(b, 0x006Cu, 0x00006666u);
+        gw32(IO_ADDR + b, 0x20000000u | back);            /* and JUMPs back */
+        b = sub;
+        b = put_method(b, 0x0064u, 0x0070u);
+        b = put_method(b, 0x006Cu, 0x00007777u);
+        gw32(IO_ADDR + b, 0x00020000u);                   /* RETURN */
+    }
+    gw32(IO_ADDR + io, sub | 2u); io += 4;              /* CALL a block */
     io = put_method(io, 0x0064u, 0x0030u);              /* NV406E semaphore offset */
     io = put_method(io, 0x006Cu, 0x0000AAAAu);          /* NV406E semaphore release */
     gw32(IO_ADDR + io, 0x20000000u | rb); io += 4;      /* the wrap: JUMP to the start */
@@ -149,13 +168,13 @@ int main(void)
     /* The start of the ring, up to put. */
     io = rb;
     gw32(IO_ADDR + io, 0); io += 4;                     /* NOP */
-    gw32(IO_ADDR + io, GCM_FLIP_MARKER | 0u); io += 4;  /* the next flip */
+    gw32(IO_ADDR + io, GCM_FLIP_MARKER | 1u); io += 4;  /* the next flip */
     io = put_method(io, 0x0064u, 0x0050u);
     io = put_method(io, 0x006Cu, 0x00001234u);
     const u32 put = io;
 
     const u32 reached0 = s_fifo_flips_reached;
-    s_fifo_flips_queued = reached0 + 2u;                /* the two flips above */
+    s_fifo_flips_queued = reached0 + 3u;                /* the three flips above */
     s_fifo_getoff = park;
     vm_write32(ctrl + 4, park);
     vm_write32(ctrl + 0, put);
@@ -165,8 +184,12 @@ int main(void)
     wait_past_grace();
     cellGcm_rsx_process_fifo();                         /* still parked: resync */
     check(s_fifo_getoff == put, "the resync moved get to put, across the wrap");
-    check(s_fifo_flips_reached == reached0 + 2u,
-          "both skipped flip markers were counted (tail and head)");
+    check(s_fifo_flips_reached == reached0 + 3u,
+          "every skipped flip marker was counted (tail, out-of-ring block, head)");
+    check(vm_read32(GCM_LABEL_GUEST_BASE + 0x60u) == 0x00006666u,
+          "the release in the block the tail JUMPs to was replayed");
+    check(vm_read32(GCM_LABEL_GUEST_BASE + 0x70u) == 0x00007777u,
+          "the release in the block the tail CALLs was replayed");
     check(vm_read32(GCM_LABEL_GUEST_BASE + 0x30u) == 0x0000AAAAu,
           "the release in the rest of the lap was replayed");
     check(vm_read32(GCM_LABEL_GUEST_BASE + 0x50u) == 0x00001234u,
