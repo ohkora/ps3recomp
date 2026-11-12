@@ -142,6 +142,20 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    # cellPad reads XInput on Windows, which sees only Xbox-style controllers.
+    # With this option it reads pads through SDL2 instead: SDL's HIDAPI drivers
+    # read a DualSense, DualShock 4 or Switch Pro controller directly, and SDL
+    # still reads Xbox pads. Audio stays on WASAPI. Point CMAKE_PREFIX_PATH at
+    # an SDL2 package (the SDL2-devel-*-VC zip, or vcpkg's sdl2) and ship
+    # SDL2.dll next to the executable.
+    option(PS3RECOMP_PAD_SDL2 "Windows: read controllers through SDL2 instead of XInput" OFF)
+    if(PS3RECOMP_PAD_SDL2)
+        find_package(SDL2 CONFIG REQUIRED)
+        target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
+        set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/cellPad.c"
+                     APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_PAD_USE_SDL2=1)
+        message(STATUS "  SDL2:         found (input backend; ship SDL2.dll with the executable)")
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required

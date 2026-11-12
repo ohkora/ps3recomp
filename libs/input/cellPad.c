@@ -8,7 +8,11 @@
  *     XInput1_3.dll, XInput9_1_0.dll); no XInput DLL means no pads
  *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
  *
- * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
+ * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows (CMake option
+ * PS3RECOMP_PAD_SDL2). XInput sees only Xbox-style pads; SDL2's HIDAPI drivers
+ * also read a DualSense, DualShock 4 or Switch Pro controller directly, and
+ * SDL still reads Xbox pads. The keyboard fallback stays on GetAsyncKeyState
+ * on Windows either way: there is no SDL window to keep SDL's keyboard state.
  */
 
 #include <time.h>
@@ -62,7 +66,25 @@ static double pad_clock(unsigned long long t0_ms)
 #endif
 
 #if PAD_BACKEND_SDL2
-  #include <SDL2/SDL.h>
+  #define SDL_MAIN_HANDLED   /* this file has no main() to rename */
+  /* Package layouts differ: distributions and Homebrew ship <SDL2/SDL.h>, the
+   * Windows development package (SDL2-devel-*-VC) puts SDL.h straight in its
+   * include directory. */
+  #if defined(__has_include)
+    #if __has_include(<SDL2/SDL.h>)
+      #include <SDL2/SDL.h>
+    #else
+      #include <SDL.h>
+    #endif
+  #else
+    #include <SDL2/SDL.h>
+  #endif
+  #if defined(_WIN32)
+    #ifndef WIN32_LEAN_AND_MEAN
+      #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>   /* the keyboard fallback's GetAsyncKeyState */
+  #endif
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -208,12 +230,12 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
  * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
  * so a title that reads the stick instead is playable too.
  *
- * Where the keys come from: GetAsyncKeyState with the XInput backend; on macOS
+ * Where the keys come from: GetAsyncKeyState on Windows (either backend); on macOS
  * CGEventSourceKeyState, which needs no event tap and no window; elsewhere SDL's
  * keyboard state, which is kept current by whoever pumps SDL's events (in
  * practice the window of the video backend). PS3RECOMP_PAD_KEYBOARD_SDL selects
  * the SDL source on macOS too, which is how the keyboard test is built. */
-#if PAD_BACKEND_XINPUT
+#if defined(_WIN32)
 static int pad_host_window_focused(void)
 {
     HWND fg = GetForegroundWindow();
