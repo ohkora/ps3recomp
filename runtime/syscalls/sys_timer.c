@@ -129,6 +129,45 @@ static void write_be64(uint32_t addr, uint64_t val)
     *p = val;
 }
 
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+/* PS3_USLEEP_SUBMS=timer: a sub-millisecond sys_timer_usleep sleeps on a
+ * high-resolution waitable timer (Windows 10 1803 and later) instead of
+ * spinning to a QPC deadline. The spin keeps the calling host thread on a
+ * core for the whole wait; a guest that polls with short sleeps (a render
+ * thread waiting for its flip with 30 us usleeps, ~80 a frame) then burns a
+ * core, half of it in kernel time from SwitchToThread, that the title's other
+ * threads need when the machine is busy. The timer gives the core back; a
+ * wait then lasts about the timer's resolution (~0.5 ms) rather than exactly
+ * the time asked. Off by default. Returns 0 where the timer is unavailable,
+ * and the caller spins as before. One timer per host thread, kept for its
+ * life. */
+static int usleep_subms_timer_wait(uint64_t usec)
+{
+    static int s_mode = -1;
+    if (s_mode < 0) {
+        const char* e = getenv("PS3_USLEEP_SUBMS");
+        s_mode = (e && strcmp(e, "timer") == 0) ? 1 : 0;
+    }
+    if (!s_mode) return 0;
+    static PPU_THREAD_LOCAL HANDLE t_timer;
+    static PPU_THREAD_LOCAL int t_failed;
+    if (t_failed) return 0;
+    if (!t_timer) {
+        t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_ALL_ACCESS);
+        if (!t_timer) { t_failed = 1; return 0; }
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)(usec * 10);   /* 100 ns units, relative */
+    if (!SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE)) return 0;
+    WaitForSingleObject(t_timer, INFINITE);
+    return 1;
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * sys_timer_usleep
  *
@@ -256,6 +295,8 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } else {
             Sleep((DWORD)(usec / 1000));
         }
+    } else if (usec > 0 && usleep_subms_timer_wait(usec)) {
+        /* slept on the high-resolution timer (PS3_USLEEP_SUBMS=timer) */
     } else if (usec > 0) {
         /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
          * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
