@@ -1840,7 +1840,8 @@ static void gcm_resync_method(u32 m, u32 v, unsigned* labels)
  * count its flip markers, push its fences, replay its sync writes. Returns
  * the IO offset it branches on to (a JUMP's target, or `ret` at a RETURN),
  * or ~0u when it stops otherwise: an unfilled park, a CALL, a word that is
- * not a command, an unmapped offset, or the size bound. */
+ * not a command, an unmapped offset, or the size bound. With `fences` NULL it
+ * only finds where the block branches on, and changes nothing. */
 static u32 gcm_resync_walk_block(u32 io, u32 ret, unsigned* fences, unsigned* labels, unsigned* flips)
 {
     for (u32 n = 0; n < GCM_RESYNC_BLOCK_WORDS; ) {
@@ -1849,7 +1850,7 @@ static u32 gcm_resync_walk_block(u32 io, u32 ret, unsigned* fences, unsigned* la
         u32 tgt;
         if (w == 0) { io += 4; n++; continue; }
         if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
-            if (s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; (*flips)++; }
+            if (fences && s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; (*flips)++; }
             io += 4; n++; continue;
         }
         if (gcm_fifo_jump_target(w, &tgt)) return tgt == io ? ~0u : tgt;
@@ -1861,7 +1862,7 @@ static u32 gcm_resync_walk_block(u32 io, u32 ret, unsigned* fences, unsigned* la
         for (u32 i = 0; i < count; i++) {
             const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) return ~0u;
             const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
-            if (subch != 0) continue;
+            if (!fences || subch != 0) continue;
             if (m == 0x0050u) { gcm_ref_push_at(v, io); (*fences)++; }
             else gcm_resync_method(m, v, labels);
         }
@@ -1947,17 +1948,45 @@ static void gcm_fifo_resync_sweep(u32 from, u32 land)
                 rescued, labels, from, land, flips, hops); }
 }
 
-/* Where the title's ring wraps: the first JUMP back to the ring's start at or
- * after `from`, below `end`. The words after it are left over from the last
- * lap and must not be replayed. `end` when there is none. */
+/* Where the title's ring wraps: the JUMP back to the ring's start at or after
+ * `from`, below `end`. The words after it are left over from the last lap and
+ * must not be replayed. `end` when there is none.
+ *
+ * Found by walking the commands (each header with its data), not by looking
+ * at every word: a method's data can look like a JUMP to the ring's start (an
+ * argument of 1 is the new-style JUMP to offset 0), and taking one for the
+ * wrap cut the sweep short, before the frame's flip marker. A JUMP out to a
+ * command block is followed back as the sweep follows it. Where the walk
+ * meets a word that is not a command, the first JUMP to the start from there
+ * on is taken. */
 static u32 gcm_fifo_wrap_point(u32 from, u32 end, u32 begin)
 {
-    for (u32 io = from; io + 4 <= end; io += 4) {
+    u32 io = from;
+    while (io + 4 <= end) {
+        const u32 ea = gcm_io2ea(io); if (!ea) return end;
+        const u32 w = vm_read32(ea), type = w >> 29;
+        u32 tgt;
+        if (w == 0 || (w & 0xFFFFFF00u) == GCM_FLIP_MARKER) { io += 4; continue; }
+        if (gcm_fifo_jump_target(w, &tgt)) {
+            if (tgt == begin) return io;
+            if (tgt == io) { io += 4; continue; }   /* a park */
+            if (tgt > io && tgt < end) { io = tgt; continue; }
+            if (tgt >= from && tgt < end) break;
+            for (u32 h = 0; tgt != ~0u && (tgt < from || tgt >= end) && h < GCM_RESYNC_BLOCK_HOPS; h++)
+                tgt = gcm_resync_walk_block(tgt, ~0u, NULL, NULL, NULL);   /* out to a block and back */
+            if (tgt != ~0u && tgt > io && tgt < end) { io = tgt; continue; }
+            break;
+        }
+        if ((w & 3u) == 2u || w == 0x00020000u) { io += 4; continue; }   /* CALL, RETURN */
+        if (type != 0 && type != 2) break;
+        const u32 count = (w >> 18) & 0x7FFu;
+        if (!count) break;
+        io += 4 + count * 4;
+    }
+    for (; io + 4 <= end; io += 4) {
         const u32 ea = gcm_io2ea(io); if (!ea) break;
-        const u32 w = vm_read32(ea);
-        if (((w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == begin) ||
-            ((w & 3u) == 1u && (w & ~3u) == begin))
-            return io;
+        u32 tgt;
+        if (gcm_fifo_jump_target(vm_read32(ea), &tgt) && tgt == begin) return io;
     }
     return end;
 }
