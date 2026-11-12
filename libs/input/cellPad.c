@@ -596,7 +596,15 @@ static void pad_sdl_close(int p, int gone)
 {
     SDL_GameController* gc = s_sdl_controllers[p];
     if (!gc) return;
-    if (gone) fprintf(stderr, "[cellPad] SDL controller on port %d disconnected (instance %d)\n", p, (int)s_sdl_ids[p]);
+    if (gone) {
+        /* Say why when SDL knows: on Windows a pad another program takes over
+         * (Steam Input grabs a DualSense when the focused window is not a
+         * Steam game) arrives here as a plain disconnect. */
+        const char* why = SDL_GetError();
+        fprintf(stderr, "[cellPad] SDL controller on port %d disconnected (instance %d)%s%s\n", p,
+                (int)s_sdl_ids[p], (why && *why) ? ": " : "", (why && *why) ? why : "");
+        SDL_ClearError();
+    }
     else      SDL_GameControllerRumble(gc, 0, 0, 0);
     SDL_GameControllerClose(gc);
     s_sdl_controllers[p] = NULL;
@@ -748,6 +756,14 @@ static void pad_init_backend(void)
              * cared. SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=0 in the
              * environment still wins over this. */
             SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#if defined(_WIN32) && defined(SDL_HINT_JOYSTICK_WGI)
+            /* Windows.Gaming.Input reports nothing while the app is not in
+             * front, and the game's window is not SDL's, so a WGI-read pad went
+             * dead whenever the window lost focus. The XInput, RAWINPUT and
+             * HIDAPI drivers read in the background; leave WGI to an explicit
+             * SDL_JOYSTICK_WGI=1 in the environment. */
+            SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_WGI, "0", SDL_HINT_DEFAULT);
+#endif
             SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
         }
         s_sdl_inited = 1;
